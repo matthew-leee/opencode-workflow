@@ -1,0 +1,14 @@
+{
+  "name": "opencode-workflow-audit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode v2.3.2 plugin: append-only, secret-redacted JSONL audit trail for sessions, tools, permissions, shells and background lifecycle events.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "2.3.2"
+  }
+}

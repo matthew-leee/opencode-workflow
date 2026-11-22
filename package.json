@@ -1,0 +1,22 @@
+{
+  "name": "opencode-workflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode v2 workflow: lean global rules, cross-vendor agent routing, audit plugin, and outer-loop supervisor.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "sync": "node scripts/sync-global.mjs",
+    "verify": "node scripts/verify-setup.mjs",
+    "prune": "node src/rsi-prune.mjs",
+    "consolidate": "node src/memory-consolidate.mjs",
+    "supervise": "node src/supervisor.mjs"
+  },
+  "dependencies": {
+    "@opencode/client": "2.3.2",
+    "@opencode/plugin": "2.3.2"
+  }
+}

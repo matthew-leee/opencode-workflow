@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Runtime artifacts
+artifacts/
+*.log
+tmp/
+.audit/
+
+# Local secrets / overrides (never commit)
+.env
+.env.*
+!.env.example
+config/opencode.local.jsonc
+
+# Editor / OS noise
+.DS_Store
+*.swp
+
+# Test harness scratch space
+test/tmp/
+coverage/

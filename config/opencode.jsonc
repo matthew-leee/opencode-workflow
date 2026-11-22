@@ -1,0 +1,280 @@
+{
+  // OpenCode v2 (2.3.2) global configuration — canonical copy.
+  // Synced to ~/.config/opencode/opencode.jsonc by `npm run sync`. Validate with `npm run verify`.
+  "$schema": "https://opencode.ai/config.json",
+
+  // Primary driver: Gemini 4 Neon at high reasoning effort (variant resolved from the model catalog).
+  "model": "openrouter/google/gemini-4-neon#high",
+  "default_agent": "build",
+
+  "compaction": {
+    "auto": true,
+    "background": true,
+    "buffer": "20%",
+    "keep": { "tokens": 15000 }
+  },
+  "tool_output": { "max_lines": 2000, "max_bytes": 51200 },
+  "media": {
+    "image": {
+      "auto_resize": true,
+      "max_width": 2000,
+      "max_height": 2000,
+      "max_base64_bytes": 5242880
+    }
+  },
+
+  // Ordered rules — later rules win. Everyday inspection/test/build stays silent;
+  // destructive or externally-visible mutations ask. Both `bash` and `shell` action names are
+  // listed because the shell tool is addressable under either name depending on the code path.
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "allow" },
+
+    // Local destructive / irreversible
+    { "action": "bash", "resource": "rm -rf*", "effect": "ask" },
+    { "action": "shell", "resource": "rm -rf*", "effect": "ask" },
+    { "action": "bash", "resource": "rm -r*", "effect": "ask" },
+    { "action": "shell", "resource": "rm -r*", "effect": "ask" },
+    { "action": "bash", "resource": "git reset*", "effect": "ask" },
+    { "action": "shell", "resource": "git reset*", "effect": "ask" },
+    { "action": "bash", "resource": "git clean*", "effect": "ask" },
+    { "action": "shell", "resource": "git clean*", "effect": "ask" },
+    { "action": "bash", "resource": "git checkout --*", "effect": "ask" },
+    { "action": "shell", "resource": "git checkout --*", "effect": "ask" },
+    { "action": "bash", "resource": "git restore*", "effect": "ask" },
+    { "action": "shell", "resource": "git restore*", "effect": "ask" },
+    { "action": "bash", "resource": "git rebase*", "effect": "ask" },
+    { "action": "shell", "resource": "git rebase*", "effect": "ask" },
+    { "action": "bash", "resource": "git commit --amend*", "effect": "ask" },
+    { "action": "shell", "resource": "git commit --amend*", "effect": "ask" },
+    { "action": "bash", "resource": "git filter-branch*", "effect": "ask" },
+    { "action": "shell", "resource": "git filter-branch*", "effect": "ask" },
+    { "action": "bash", "resource": "git stash drop*", "effect": "ask" },
+    { "action": "shell", "resource": "git stash drop*", "effect": "ask" },
+    { "action": "bash", "resource": "git stash clear*", "effect": "ask" },
+    { "action": "shell", "resource": "git stash clear*", "effect": "ask" },
+    { "action": "bash", "resource": "git worktree remove*", "effect": "ask" },
+    { "action": "shell", "resource": "git worktree remove*", "effect": "ask" },
+    { "action": "bash", "resource": "kill*", "effect": "ask" },
+    { "action": "shell", "resource": "kill*", "effect": "ask" },
+    { "action": "bash", "resource": "chown*", "effect": "ask" },
+    { "action": "shell", "resource": "chown*", "effect": "ask" },
+    { "action": "bash", "resource": "sudo*", "effect": "ask" },
+    { "action": "shell", "resource": "sudo*", "effect": "ask" },
+
+    // Remote / publish / infrastructure / data mutation
+    { "action": "bash", "resource": "git push*", "effect": "ask" },
+    { "action": "shell", "resource": "git push*", "effect": "ask" },
+    { "action": "bash", "resource": "git remote*", "effect": "ask" },
+    { "action": "shell", "resource": "git remote*", "effect": "ask" },
+    { "action": "bash", "resource": "npm publish*", "effect": "ask" },
+    { "action": "shell", "resource": "npm publish*", "effect": "ask" },
+    { "action": "bash", "resource": "npm unpublish*", "effect": "ask" },
+    { "action": "shell", "resource": "npm unpublish*", "effect": "ask" },
+    { "action": "bash", "resource": "cargo publish*", "effect": "ask" },
+    { "action": "shell", "resource": "cargo publish*", "effect": "ask" },
+    { "action": "bash", "resource": "npm i -g*", "effect": "ask" },
+    { "action": "shell", "resource": "npm i -g*", "effect": "ask" },
+    { "action": "bash", "resource": "npm install -g*", "effect": "ask" },
+    { "action": "shell", "resource": "npm install -g*", "effect": "ask" },
+    { "action": "bash", "resource": "ssh*", "effect": "ask" },
+    { "action": "shell", "resource": "ssh*", "effect": "ask" },
+    { "action": "bash", "resource": "scp*", "effect": "ask" },
+    { "action": "shell", "resource": "scp*", "effect": "ask" },
+    { "action": "bash", "resource": "rsync*", "effect": "ask" },
+    { "action": "shell", "resource": "rsync*", "effect": "ask" },
+    { "action": "bash", "resource": "curl -X*", "effect": "ask" },
+    { "action": "shell", "resource": "curl -X*", "effect": "ask" },
+    { "action": "bash", "resource": "curl --data*", "effect": "ask" },
+    { "action": "shell", "resource": "curl --data*", "effect": "ask" },
+    { "action": "bash", "resource": "curl -d*", "effect": "ask" },
+    { "action": "shell", "resource": "curl -d*", "effect": "ask" },
+    { "action": "bash", "resource": "docker rm*", "effect": "ask" },
+    { "action": "shell", "resource": "docker rm*", "effect": "ask" },
+    { "action": "bash", "resource": "docker rmi*", "effect": "ask" },
+    { "action": "shell", "resource": "docker rmi*", "effect": "ask" },
+    { "action": "bash", "resource": "docker system prune*", "effect": "ask" },
+    { "action": "shell", "resource": "docker system prune*", "effect": "ask" },
+    { "action": "bash", "resource": "docker push*", "effect": "ask" },
+    { "action": "shell", "resource": "docker push*", "effect": "ask" },
+    { "action": "bash", "resource": "systemctl*", "effect": "ask" },
+    { "action": "shell", "resource": "systemctl*", "effect": "ask" },
+    { "action": "bash", "resource": "psql*", "effect": "ask" },
+    { "action": "shell", "resource": "psql*", "effect": "ask" },
+    { "action": "bash", "resource": "mysql*", "effect": "ask" },
+    { "action": "shell", "resource": "mysql*", "effect": "ask" },
+    { "action": "bash", "resource": "sqlite3*", "effect": "ask" },
+    { "action": "shell", "resource": "sqlite3*", "effect": "ask" },
+    { "action": "bash", "resource": "gcloud *", "effect": "ask" },
+    { "action": "shell", "resource": "gcloud *", "effect": "ask" },
+    { "action": "bash", "resource": "aws *", "effect": "ask" },
+    { "action": "shell", "resource": "aws *", "effect": "ask" },
+    { "action": "bash", "resource": "terraform apply*", "effect": "ask" },
+    { "action": "shell", "resource": "terraform apply*", "effect": "ask" },
+    { "action": "bash", "resource": "terraform destroy*", "effect": "ask" },
+    { "action": "shell", "resource": "terraform destroy*", "effect": "ask" },
+    { "action": "bash", "resource": "kubectl delete*", "effect": "ask" },
+    { "action": "shell", "resource": "kubectl delete*", "effect": "ask" },
+
+    // Secrets. These must stay after the baseline allow so they are not overridden.
+    // `.env` and `.env.*` are gated on every file surface (read/edit/write/patch) and on the
+    // shell, where a resource is the command line, not a path. Command-shaped globs catch
+    // `cat .env`, `cat ./.env`, `cat .env foo`, and a bare trailing `*.env`.
+    { "action": "read", "resource": "*.env", "effect": "ask" },
+    { "action": "read", "resource": "*.env.*", "effect": "ask" },
+    { "action": "edit", "resource": "*.env", "effect": "ask" },
+    { "action": "edit", "resource": "*.env.*", "effect": "ask" },
+    { "action": "write", "resource": "*.env", "effect": "ask" },
+    { "action": "write", "resource": "*.env.*", "effect": "ask" },
+    { "action": "patch", "resource": "*.env", "effect": "ask" },
+    { "action": "patch", "resource": "*.env.*", "effect": "ask" },
+    { "action": "bash", "resource": "*.env*", "effect": "ask" },
+    { "action": "shell", "resource": "*.env*", "effect": "ask" },
+    { "action": "bash", "resource": "* .env*", "effect": "ask" },
+    { "action": "shell", "resource": "* .env*", "effect": "ask" },
+    { "action": "bash", "resource": "*/*.env*", "effect": "ask" },
+    { "action": "shell", "resource": "*/*.env*", "effect": "ask" },
+    { "action": "bash", "resource": "*.env *", "effect": "ask" },
+    { "action": "shell", "resource": "*.env *", "effect": "ask" },
+    { "action": "bash", "resource": "*.env", "effect": "ask" },
+    { "action": "shell", "resource": "*.env", "effect": "ask" },
+    { "action": "read", "resource": "*id_rsa*", "effect": "ask" },
+    { "action": "read", "resource": "*.pem", "effect": "ask" },
+    { "action": "read", "resource": "*/secrets/*", "effect": "ask" },
+    // Explicit template escape hatch for FILE-PATH tools only, declared after every ask so
+    // later-wins ordering keeps `.env.example` readable/writable while real `.env` files ask.
+    // `read`/`edit`/`write`/`patch` resources are a single file path, so a `*.env.example` glob
+    // cannot match anything else.
+    { "action": "read", "resource": "*.env.example", "effect": "allow" },
+    { "action": "edit", "resource": "*.env.example", "effect": "allow" },
+    { "action": "write", "resource": "*.env.example", "effect": "allow" },
+    { "action": "patch", "resource": "*.env.example", "effect": "allow" },
+    // Deliberately NO allow for `shell`/`bash`. Their resource is the whole command string, so a
+    // trailing-glob allow would let a command that merely ends in `.env.example` through while
+    // still reading a real `.env`: `cat .env # .env.example` or `cat .env; cat .env.example` would
+    // match `*.env.example` and bypass the `.env` ask. Any command mentioning `.env*` therefore
+    // fails closed to `ask` via the command-glob rules above.
+  ],
+
+  "agents": {
+    // Primary driver — decides and executes, routes work to the agents below.
+    "build": {
+      "mode": "primary",
+      "model": "openrouter/google/gemini-4-neon#high",
+      "description": "Primary driver. Plans, executes, and auto-routes work to worker/reviewer/fact-checker/escalation agents."
+    },
+
+    // Plan mode: read + shell allowed, edits restricted to plan artefacts.
+    "plan": {
+      "mode": "primary",
+      "model": "openrouter/google/gemini-4-neon#high",
+      "description": "Read-only planner. Investigates and writes plans; cannot touch implementation files.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "write", "resource": "*", "effect": "deny" },
+        { "action": "patch", "resource": "*", "effect": "deny" },
+        { "action": "edit", "resource": "/root/.opencode/plan/*", "effect": "allow" },
+        { "action": "write", "resource": "/root/.opencode/plan/*", "effect": "allow" },
+        { "action": "edit", "resource": "/root/pi-projects/**/PLAN.md", "effect": "allow" },
+        { "action": "write", "resource": "/root/pi-projects/**/PLAN.md", "effect": "allow" }
+      ]
+    },
+
+    // Bounded implementation: cheap, fast, allowed to edit and run tests.
+    "worker": {
+      "mode": "subagent",
+      "model": "openrouter/deepseek/deepseek-v4.1-flash-1017",
+      "description": "Bounded implementer for clearly specified, routine edits/tests/docs. Reports what changed and what it verified; never commits.",
+      "steps": 60,
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "allow" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "question", "resource": "*", "effect": "deny" }
+      ]
+    },
+
+    // Independent cross-vendor review: no writes, inspection only.
+    "reviewer": {
+      "mode": "subagent",
+      "model": "openrouter/anthropic/claude-sonnet-5.5",
+      "description": "Independent cross-vendor code reviewer. Audits diffs against requirements and rules; never edits, never commits.",
+      "steps": 40,
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "write", "resource": "*", "effect": "deny" },
+        { "action": "patch", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "question", "resource": "*", "effect": "deny" }
+      ]
+    },
+
+    // Independent factual/citation verification.
+    "fact-checker": {
+      "mode": "subagent",
+      "model": "openrouter/anthropic/claude-sonnet-5.5",
+      "description": "Independent cross-vendor fact and citation verifier. Re-checks claims and their references via pi_search and file reads; read-only.",
+      "steps": 40,
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "write", "resource": "*", "effect": "deny" },
+        { "action": "patch", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "question", "resource": "*", "effect": "deny" }
+      ]
+    },
+
+    // Mid-level escalation: stuck debugging, high blast radius.
+    "escalate-opus": {
+      "mode": "subagent",
+      "model": "openrouter/anthropic/claude-opus-5.5",
+      "description": "Escalation for repeated failures or high-blast-radius changes (data, auth, migrations, release). May edit; reports reasoning and risk.",
+      "steps": 60,
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "allow" }
+      ]
+    },
+
+    // Top-ceiling escalation.
+    "escalate-fable": {
+      "mode": "subagent",
+      "model": "openrouter/anthropic/claude-fable-5.2",
+      "description": "Top-ceiling escalation for genuinely frontier-hard problems after lower tiers fail. May edit; reports reasoning and remaining risk.",
+      "steps": 60,
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "allow" }
+      ]
+    },
+
+    // Cross-vendor reviewer used when Claude wrote the code. GPT-6.1 Terra is banned.
+    "alt-reviewer": {
+      "mode": "subagent",
+      "model": "openrouter/openai/gpt-6.2-sol",
+      "description": "Non-Anthropic reviewer/fact-checker used whenever Claude produced the code or claims. Read-only.",
+      "steps": 40,
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "write", "resource": "*", "effect": "deny" },
+        { "action": "patch", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "question", "resource": "*", "effect": "deny" }
+      ]
+    }
+  },
+
+  "mcp": {
+    "servers": {
+      "pi_search": {
+        "type": "local",
+        "command": ["/root/pi-projects/pi-search/bin/pi-search", "mcp"],
+        "cwd": "/root/pi-projects/pi-search",
+        "environment": {
+          "PI_SEARCH_SEARXNG_URL": "http://127.0.0.1:8080",
+          "PI_SEARCH_DECISION_MODEL": "~perplexity/pplx-decider-latest"
+        },
+        "codemode": true
+      }
+    }
+  },
+
+  // Local audit plugin (implemented in Wave 2B; loaded and verified in Wave 3A).
+  "plugins": ["/root/pi-projects/opencode-workflow/plugins/audit-logger"]
+}
