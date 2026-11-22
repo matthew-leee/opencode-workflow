@@ -5,6 +5,199 @@ not been published, so sections use plan waves instead of release numbers.
 
 ## [Unreleased]
 
+### Fixed — Wave E: the last two scorer regex defects from the independent Reviewer sign-off
+
+Two three-line regex defects in `bench/shootout/scorers.mjs`, each with a regression test. No config,
+no harness behaviour and no artifact changed; zero paid LLM calls.
+
+- **`splitFindingBlocks()` now splits contiguous list/numbered finding lines**
+  (`^\s*(?:\d+[.)]|[-*])\s+`) into separate finding blocks while the active markdown heading stays the
+  `section` context. Previously `1. src/routes.mjs reviewed` and `2. src/format.mjs path traversal`
+  collapsed into ONE block, so the traversal keyword from item 2 lent credit to the innocent
+  `src/routes.mjs` mention in item 1 (`found: true` for a bug the review never attributed).
+- **`detectDirectoryReads()` accepts an explicit `./` relative prefix** (`(?:\.\/)?` on both the
+  wildcard and the bare-directory pattern), so `cat ./src/*` and `grep -rn TODO ./src` are caught as
+  T2 forbidden probes like their `src/...` forms. Naming one file (`grep -n clampRange ./src/calc.mjs`)
+  and unrelated relative paths (`./package.json`, `./test/calc.test.mjs`) stay non-probes.
+- **Tests (187 → 189 total; 83 → 85 shootout).** `test/shootout.test.mjs` gained a contiguous
+  numbered-item cross-credit regression (asserting `path_traversal` is `found: false`, and that a
+  single item containing both the file and the keyword still earns it) and a `./`-prefix directory
+  probe regression (positive and negative cases). Both were verified against the pre-fix scorer: they
+  fail there for the intended reason and pass after the fix.
+- **Verified:** `npm test` — **189 tests, 189 pass, 0 fail, 0 skipped** (26 audit-logger + 78
+  workflow-automation + 85 shootout), fully offline.
+
+### Added — reusable Model Shootout harness (`bench/shootout/`) plus the approved live 50-run sweep
+
+A production measurement instrument, not a demo: 10 approved models x 5 tasks, every run in its own
+isolated workspace, scored by hidden oracles the model never sees, with a layered budget fuse. This
+is the evidence source for the model-lineup decisions in `Vision.md` / `Decisions.md`.
+
+- **`bench/shootout/runner.mjs`** — CLI (`npm run shootout`) that plans, executes, meters, scores and
+  reports the sweep. Per run: fresh directory, own `git init` + single initial commit, own
+  `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_STATE_HOME`/`XDG_CACHE_HOME`, a minimal generated
+  `opencode.jsonc` (no MCP, no plugins) and `--standalone`, plus a read-only copy of the OpenRouter
+  credential into the isolated data dir; the live `~/.config/opencode` and `~/.local/share/opencode`
+  are never written. The generated permission set allows only the run's workspace, denies
+  `subagent`/`question`/`websearch`/`webfetch`/image generation, denies file tools and shell for
+  `/root/**` outside that workspace, and denies the scratch roots (`/tmp`, `os.tmpdir()`) so no run
+  can read a sibling run's already-installed oracle.
+- **Four budget layers** (all independently tested): pre-run guard (`spent + reserve >= budget`
+  refuses), preflight worst-case estimate vs `--per-run-cap-usd` (skips are recorded in `skipped`,
+  never silently dropped), streaming per-event cost kill while the run is in flight, and post-run
+  reconciliation before the next launch decision.
+- **`bench/shootout/roster.mjs`** — the approved 10-model roster (4 workers + 6 frontier) with a
+  catalog verifier: every `#variant` is re-checked against `/root/.cache/opencode/models.json`, and an
+  unadvertised reasoning effort (e.g. `kimi-k3.1-pro#medium`) is dropped with a recorded
+  `variantNote` rather than substituted. Workers run first, then frontier ordered by blended $/1M, so
+  a mid-sweep budget stop consumes the cheapest slots first.
+- **`bench/shootout/tasks.mjs`** — five self-contained fixtures, each with visible files, a hidden
+  oracle installed only after the model exits, and a reference fix that proves the oracle is
+  satisfiable: T1 `bugfix_precision` (cent-ledger drift + sliding-window boundary), T2
+  `scope_discipline` (fix one function; two tempting out-of-scope files are a diff-scope and
+  probe-detection trap), T3 `citation_honesty` (three real buried facts + two constants that do not
+  exist), T4 `hard_multifile_debug` (coalescing cache rejection poisoning/size bound/TTL + batch retry
+  queue error swallowing), T5 `code_review` (three planted bugs, two clean decoys, read-only tree).
+- **`bench/shootout/scorers.mjs`** — JSONL event parsing, cost reconciliation (`reported` vs
+  `estimated`), tool-error/step metrics, hidden-oracle + public-suite + anti-cheat scoring, diff-scope
+  and forbidden-probe detection, citation and review rubrics, leaderboard aggregation. A run passes at
+  score >= 0.9; a timeout stays a timeout even when the workspace had already reached a passing state,
+  and never counts as solved.
+- **Output artifacts** (gitignored): `REPORT.md`, `summary.json`, `config-snapshot.json` and, per run,
+  `runs/<runId>.json` (the scored, sanitized record) plus `runs/<runId>/stdout.jsonl` (the raw event
+  stream), so every score is auditable against the raw trace. `runs/<runId>/{repo,xdg}/` is the temp
+  workspace and is deleted after scoring unless `--keep-temp` is passed; `run-console.log` exists only
+  when the sweep's stdout was redirected there. (The original entry listed
+  `runs/<runId>/{stdout.jsonl,run.json,repo/}`, which never matched what the runner writes — corrected
+  in Wave D.)
+- **Tests (104 → 187 total; 26 audit-logger + 78 workflow-automation + 83 shootout).** New
+  `test/shootout.test.mjs` with **83 tests**
+  covering roster/catalog drift, price ordering, budget guards and the streaming kill, isolated-config
+  and workspace isolation (including that a sibling run's workspace and the harness sources are
+  denied), JSONL parsing and cost reconciliation, each task's hidden oracle against its reference fix
+  (and failing against the broken initial state), the scope/probe/anti-cheat/citation/review scorers,
+  leaderboard math, report rendering and the `--dry-run` plan. Offline only: no live provider calls.
+- **Live sweep executed (user-approved, 2026-11-22).** `npm run shootout -- --budget-usd 5.0
+  --per-run-cap-usd 0.60 --timeout-sec 180 --concurrency 4` — **50/50 runs started, 0 skipped, 0 failed
+  to launch**, stop reason `complete`, wall clock **11m49s**, **spend $2.6531 of the $5.00 hard cap**
+  (largest single run $0.3874, under the $0.60 per-run cap), 46 `ok` + 4 `timeout`, 43/50 runs at or
+  above the 0.9 threshold, 539 tool calls / 11 tool errors (10 isolation denials + 1 file-not-found) /
+  462,373 input and 84,697 output tokens.
+- **What the sweep measured (raw, nothing retried or hidden).** `tencent/hy4-flash` solved 5/5 for
+  $0.0082 ($0.0016 per solved task) and `deepseek-v4.1-flash-1017` 5/5 for $0.0273; `gpt-6.2-sol`,
+  `kimi-k3.1-pro` and `gemini-4-hydrogen` solved 5/5 at $0.23–$0.52. T2's scope/probe trap was passed
+  by all 10 models (nobody's diff or tool trace escaped the allowed files). T3's trick premise cost
+  only `claude-opus-5.5` a point (0.85 — it mentioned the non-existent `REDIS_BREAKER_THRESHOLD`
+  without an explicit absent/unverified statement). On T5, eight models found all three planted bugs;
+  `gpt-6-luna` missed the null-metadata crash (0.83), `minimax-m3.1-flash` found all three but also
+  flagged all three clean decoys (0.70), and `claude-opus-5.5` found all three with one decoy false
+  positive (0.90). Four 180s timeouts: `minimax-m3.1-flash__T1`, `qwen4-max__T4` and
+  `gemini-4-neon__T1` had already reached a passing workspace when killed; `gemini-4-neon__T4` stalled
+  168s after a `step_start` with no event and no retry and scored 0.30. Two upstream rate-limit retries
+  hit `gpt-6.2-sol` (`__T1`, `__T4`); both recovered and still scored 1.00. Ten permission denials
+  were recorded across 6 runs: eight models tried to stage a scratch verification script under `/tmp`
+  (denied so no run can read a sibling run's workspace), one listed `bench/shootout/` where the hidden
+  oracles live, and one tried to read the sweep's own `run-console.log` — the isolation wall engaging,
+  reported per run rather than treated as clean.
+- **Verified:** `npm test` — **187 tests, 187 pass, 0 fail, 0 skipped** (26 audit-logger + 78
+  workflow-automation + 83 shootout; Wave D added 30 shootout regressions). `npm run shootout --
+  --dry-run` prints the catalog check, the roster, all five tasks and a $2.9215 worst-case estimate for
+  the 50-run sweep before any spend.
+- **Residual, stated rather than papered over:** 11 of 539 tool calls (2.0%) errored — 10 permission
+  denials (8 `/tmp` scratch-staging attempts, 2 harness peeks) plus 1 file-not-found on a test file the
+  model assumed existed. Denying `/tmp` is correct for cross-run safety but does add friction for
+  models that prefer to stage verification scripts outside the workspace; that friction is measured,
+  not hidden. Timeouts are wall-clock limits rather than provider failures, and the roster's price
+  snapshot is a point-in-time copy of the catalog, so cost-per-pass comparisons should be re-measured
+  rather than quoted indefinitely.
+
+### Fixed — Wave D: six blocking harness defects + provenance/artifact corrections in the Model Shootout
+
+An independent Reviewer audited `bench/shootout/*` against all 50 raw 2026-11-22 transcripts and found
+six defects that made the instrument either unsafe or unfair, plus stale provenance/artifact
+documentation. Every fix below has a regression test; **zero live LLM calls** were made (all 30 new
+tests are offline, and `artifacts/shootout-20261122/` was left byte-identical as the raw evidence).
+
+- **Concurrent runs could overshoot the budget.** The worker loop only checked *money already spent*,
+  so four workers could each pass the guard and then spend up to the per-run cap concurrently (a $1.00
+  cap with $0.30 runs could reach $1.20). Every run now reserves its worst case (`perRunCapUsd`)
+  *before* spawning, so `committed + inFlightReserved + safetyReserve <= budgetUsd` holds for every
+  concurrent worker (`canReserveRun()`); the reservation is released and reconciled with the measured
+  cost when the run finishes. Regression: 4 workers x $0.30 under a $1.00 cap start exactly 3, peak
+  concurrency 3, spend $0.90, stop reason `budget`.
+- **Mixed reported/estimated step cost discarded earlier estimates.** `extractMetrics()` (and the
+  streaming `CostTracker`) treated "any step reported a cost" as "use reported cost only", quietly
+  losing the token estimates of steps whose provider reported none. Cost is now summed **per step**:
+  a step with a reported cost contributes that cost, a step with only tokens contributes its own
+  estimate, and the run is labelled `reported` / `estimated` / `mixed`.
+- **The child process inherited the whole parent environment.** Every model process now gets an
+  allowlisted environment (`PATH`, `HOME`, `NODE_ENV`, `TERM`, `OPENROUTER_API_KEY`, the run's
+  `XDG_*`) instead of all of the caller's secrets and tokens (`ALLOWED_CHILD_ENV`).
+- **The copied credential was left behind.** `auth.json` was copied into each run's temp XDG data dir
+  and stayed there after the run. It is now deleted as soon as the run finishes (even with
+  `--keep-temp`), the temp workspace (`runs/<runId>/{repo,xdg}`) is deleted after scoring unless
+  `--keep-temp` is passed, and only the sanitized run record plus `stdout.jsonl` remain.
+- **An over-broad shell allow could override earlier denies.** The `*<workspace>*` bash/shell allow is
+  a substring match on the command string, so a command that mentioned its own workspace could also
+  reference `..` or `/root`. Parent-traversal denies (`*../*`, `* ..*`, `..`) and the
+  `/root`/harness-source denies are now re-applied *after* the workspace allow (later rules win).
+- **T1/T2/T4 prompts asked for a test command Node 22 cannot run.** `node --test test/` fails with
+  `Cannot find module '<repo>/test'` on Node 22. The prompts now name the files
+  (`node --test test/ledger.test.mjs`, `test/calc.test.mjs`, `test/pipeline.test.mjs`) and the fixture
+  `package.json` uses `node --test test/*.test.mjs`.
+- **`pathMatches()` credited look-alike citations.** Suffix/basename matching let
+  `elsewhere/config.mjs` (or a bare `config.mjs`) satisfy a citation for `src/config.mjs`. Matching is
+  now exact on the normalized repo-relative path. T3 also subtracts `fabricatedPenalty` (0.1) per
+  citation to a file that does not exist, and honours a `clean_status` gate so a dirty or
+  unverifiable workspace cannot reach 0.9 on citation credit alone.
+- **T3's absence markers missed natural phrasings.** `no redis`, `there's no`, `not configured`,
+  `neither … exists` (regex markers), `doesn't appear`, `nowhere in`, `not mentioned` and friends now
+  count as an explicit absence. Re-scoring the archived `claude-opus-5.5__T3` transcript gives
+  **1.00** (raw 0.85).
+- **T5 matched globally instead of per finding, and punished clean sections.** Bug credit now requires
+  the filename and the defect keywords inside **one finding block** (blank-line/heading-separated
+  sections, with heading context carried to the blocks beneath), `missing` was added to the
+  null/absent-metadata keywords, and decoy false positives are block-scoped, counted once per decoy,
+  exempt in explicit negation/clean sections (`not flagged`, `clean`, `valid`, `no issue`, …) and
+  require the decoy's identifier or a `file:line` into that file. Re-scoring the archived transcripts
+  gives `gpt-6-luna__T5` **1.00** (raw 0.83) and `minimax-m3.1-flash__T5` **0.90** (raw 0.70).
+- **A deleted `.git` was scored as a clean tree.** `gitStatusEntries()` returned `[]` for any git
+  failure, so removing `.git` (or making `git status` fail) read as "read-only respected". It now
+  fails closed with `{ clean: false, entries, error }`, and the read-only rubrics (T3, T5) score zero
+  when `clean_status` is not true. The porcelain parse also stopped trimming the status column
+  (`git(..., { trim: false })`), which had been shifting the first path (`src/x.mjs` → `rc/x.mjs`).
+- **T2 wildcard probes went undetected.** `cat src/*`, `grep -rn TODO src`, `ls src` and `cat *.mjs`
+  reached the forbidden files without naming them. `findForbiddenProbes()` now also flags
+  whole-directory/glob reads when a forbidden file lives in that directory, while still ignoring
+  single-file commands (`node --test test/calc.test.mjs`, `grep -n clampRange src/calc.mjs`).
+- **The leaderboard hid failures and double-penalized timeouts.** `Capability` averaged completed runs
+  only, so 3 solved + 2 timeouts could print `Capability 100`; `stopDiscipline` subtracted the timeout
+  count twice (once as a failure, once as a timeout). `Capability` is now the mean over **all attempted
+  runs** (a failed run contributes its workspace score capped just below the pass threshold, never a
+  pass), `Solved` is `passed/attempted`, every attempted task keeps its effective score in the matrix,
+  and each failed run is penalized once.
+- **Provenance and artifacts were documented wrong.** `config-snapshot.json` now records the template
+  *and* the same rules resolved for a run workspace, the git HEAD commit/branch/dirty flag, the catalog
+  check and the in-flight admission rule, instead of only the literal `<workspace>` template;
+  `summary.json` carries `git.commit` and `catalogCheck`; `verifyAgainstCatalog()` runs before live
+  runs (a readable catalog that contradicts the roster refuses to start with a one-line error and exit
+  code 2, a missing catalog is recorded as a warning). `REPORT.md`/README now describe the real artifact
+  layout (`runs/<runId>.json` + `runs/<runId>/stdout.jsonl`, temp workspace only with `--keep-temp`) and
+  state honestly that OpenCode permission rules are command-string filters, **not an OS container
+  sandbox** (the stale "/tmp residual" sentence is gone).
+- **Documented audit trail.** README gained an "Independent Reviewer Transcript Audit" table beside the
+  2026-11-22 sweep table: raw vs audited scores (Opus T3 0.85 → 1.00, Luna T5 0.83 → 1.00, MiniMax T5
+  0.70 → 0.90), the audited 46/50 pass count, and the audited leaderboard — with the raw table kept as
+  recorded.
+- **Tests (157 → 187; 53 → 83 shootout).** 30 new offline regressions: concurrent 4-worker reservation
+  under a $1.00 cap, mixed per-step cost accounting (metrics + streaming tracker), exact-path citation
+  matching, the Opus-style absence phrasing, natural absence markers, the Luna-style `Missing metadata`
+  finding, the MiniMax-style `Not flagged` decoy exemption and per-block cross-section rejection,
+  deleted-`.git` fail-closed + dirty-T3 gate, wildcard/directory probes, timeout-inclusive capability
+  and stop discipline, the allowlisted child environment, `auth.json` deletion with and without
+  `--keep-temp`, the resolved config snapshot and report wording, git provenance in `summary.json`, the
+  roster/catalog refusal path, the post-allow traversal denies, and the Node-22-safe prompt commands.
+
 ### Fixed — Wave 8: three final reviewer edge cases (evidence attribution, in-target symlinks, document-only merge)
 
 The last three surgical defects from the independent reviewer's final audit. No config file changed;

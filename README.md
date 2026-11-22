@@ -11,7 +11,7 @@ Pi remains installed and untouched. `pi-search` remains the Rust research engine
 (sha256 `23fd8a42…`) and carries both Wave 6A's `.env.example` command-surface fix and the Wave 6B
 hardening.**
 `node --test test/audit-logger.test.mjs` is 26/26 PASS, `node --test test/workflow-automation.test.mjs`
-is 78/78 PASS, `npm test` is **104/104 PASS**, and `npm run verify -- --schema --skip-binary`, `npm run
+is 78/78 PASS, `npm test` is **189/189 PASS**, and `npm run verify -- --schema --skip-binary`, `npm run
 verify` (isolated) and `npm run verify -- --schema --live` (the real `~/.config/opencode/`) all end
 **Verify PASS with exit 0**. Wave 8 closed the last three surgical edge cases from the independent
 reviewer audit: session-less records no longer inflate model-routing or dead-skill evidence, an
@@ -45,9 +45,17 @@ Remaining unverified items are listed at the end. See `Vision.md` for the requir
 │   ├── memory-consolidate.mjs # npm run consolidate — MEMORY.md <= 2,500 chars + shared audit readers
 │   ├── rsi-prune.mjs      # npm run prune       — weekly RSI review with forgetting guard
 │   └── openrouter-client.mjs # redacting OpenRouter HTTP client used by the three above
+├── bench/
+│   └── shootout/          # reusable 10-model x 5-task model shootout (npm run shootout)
+│       ├── runner.mjs     # CLI, isolation, layered budget fuses, JSONL trace capture, report renderer
+│       ├── roster.mjs     # approved 10-model roster + catalog verification + price snapshot
+│       ├── tasks.mjs      # five self-contained fixtures (visible files, hidden oracles, reference fixes)
+│       └── scorers.mjs    # metrics extraction, hidden-oracle/scope/probe/rubric scoring, leaderboard
 ├── test/
 │   ├── audit-logger.test.mjs      # 26 tests: redaction, hooks, events, writer safety, teardown
-│   └── workflow-automation.test.mjs # 78 tests: supervisor, memory, RSI guard, client, sync, verify, JSONL integration
+│   ├── workflow-automation.test.mjs # 78 tests: supervisor, memory, RSI guard, client, sync, verify, JSONL integration
+│   └── shootout.test.mjs          # 85 tests: roster/catalog, budget/reservation fuses, isolation, env + credential hygiene, scorers, report, dry run
+├── artifacts/             # gitignored: live shootout output (REPORT.md, summary.json, per-run traces)
 ├── Vision.md              # authoritative destination and requirements
 ├── Decisions.md           # language, model lineup, outer-loop architecture, verified config shapes
 ├── README.md
@@ -72,15 +80,236 @@ npm install          # installs @opencode/plugin@2.3.2 and @opencode/client@2.3.
 
 | Script | Command | Purpose |
 | --- | --- | --- |
-| `npm test` | `node --test test/*.test.mjs` | Full offline suite (**104 tests**: 26 audit-logger + 78 workflow-automation). No network, no paid model calls, no writes outside temp dirs. |
+| `npm test` | `node --test test/*.test.mjs` | Full offline suite (**189 tests**: 26 audit-logger + 78 workflow-automation + 85 shootout). No network, no paid model calls, no writes outside temp dirs. |
 | `npm run sync` | `node scripts/sync-global.mjs` | Install `config/opencode.jsonc` + `config/AGENTS.md` into `~/.config/opencode/`, rotate an exposed `service.json`, move legacy v1 files into `v1-disabled/`, back up anything it overwrites. Every write goes through an atomic temp file with a **cryptographically random name** opened `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`, so a planted `.tmp` symlink is never opened and a symlink at the destination is refused **on its lexical path** — including an in-target link such as `opencode.jsonc -> victim.json`, whose referent is never overwritten (the link is replaced by `rename`, never followed). `--dry-run` previews, `--skip-service-rotate` keeps the credential file, `--target-dir DIR` retargets. |
 | `npm run verify` | `node scripts/verify-setup.mjs` | Parse JSONC strictly and assert the OCW-02/03/04 invariants: compaction/tool-output/media limits bounded, every agent (and the top-level default model) pinned to an id in the explicit **OCW-03 approved model catalog** rather than merely matching a `provider/model` shape, primary/subagent modes and bounded subagent steps, read-only roles denying `edit`/`write`/`patch`, `.env` protected on read/edit/write/patch/bash/shell while `.env.example` stays allowed for the file-path tools only (shell/bash `.env*` fails closed to `ask`, and the verifier resolves `cat .env # .env.example` / `cat .env; cat .env.example` to prove it), plus Terra ban, `pi_search` + codemode and permission ordering. Then run `opencode --standalone debug config` / `debug agents` / `mcp list` against an isolated `XDG_DATA_HOME`, require the OpenCode log and a fresh `plugin.loaded` record **stamped with `plugin: "opencode-workflow-audit"` and `loggingEnabled: true`** from that run (a missing log, a bare/foreign `plugin.loaded` line, or a runtime-disabled logger is a hard failure, never a warning), and report `mcp list` honestly. `--schema` adds the live schema check, `--live` verifies `~/.config/opencode/` instead of an isolated copy, `--skip-binary` stays offline, `--json` prints machine output. The `debug config` gate is shape-tolerant since Wave 7B: it accepts a plain config object **or** 2.3.2's array of `{type,path,info}` entries (merging `info` from `type:"document"` entries only — a `directory` or other non-document entry is never merged even when it carries a non-empty `info` — with later documents winning per top-level key), and a `model` given as a string id **or** as the normalized `{providerID,model,variant}` object — both then held to the OCW-03 catalog — while still rejecting `{}`, `[]`, a directory-only entry list, and a config that resolves no model, no local `pi_search` (codemode not explicitly disabled) or no `audit-logger` plugin. |
 | `npm run prune` | `node src/rsi-prune.mjs` | Weekly RSI review over the audit JSONL: tool/model error rates, permission blocks, shell friction, AGENTS.md size, Terra scan, dead skills. Read-only; **each proposal is gated on its own** distinct-project/session evidence (2 projects + 5 sessions), refused proposals are listed under `pruning.withheld` with their per-proposal `evidence`, and `--force` overrides while recording `forced` on the proposal. Per-proposal evidence only counts a project when the *same* record also carries an attributed session — the same rule applies to the permission/shell, model-routing and dead-skill evidence sets — so a session-less `plugin.loaded`/`shell.before`/usage/skill record from a second tree can never supply the second project that unlocks a global change. `--out FILE` is canonicalized through a segment-by-segment `realpathDeep` (which resolves dangling symlinks instead of falling back to the link's own path) and refused inside `/root/.pi`, `pi-workflow-tools`, the live OpenCode config or `config/`, and the write itself uses `O_NOFOLLOW`, so a planted symlink cannot redirect the report. `--days N`, `--audit-dir DIR`, `--json`, `--with-llm`. |
 | `npm run consolidate` | `node src/memory-consolidate.mjs` | Rebuild a project's `MEMORY.md` from recent audit telemetry, hard-capped at 2,500 characters (one compression retry, then section-preserving truncation). Workspace attribution compares canonical **full paths**, so two absolute workspaces that share a basename never pool their telemetry, and an absolute-vs-relative (or bare-label) mismatch fails closed instead of matching on basename; an existing 0-byte `MEMORY.md` is still backed up to `MEMORY.md.bak` before being replaced. Needs `OPENROUTER_API_KEY` in the environment or a passed model. `--workspace DIR`, `--audit-dir DIR`, `--dry-run`, `--max-chars N`. |
+| `npm run shootout` | `node bench/shootout/runner.mjs` | Run the 10-model x 5-task Model Shootout through OpenCode headless mode in per-run isolated workspaces, score it with hidden oracles, and write `REPORT.md` + `summary.json`. **It makes paid OpenRouter calls** whenever it runs without `--dry-run`; `--dry-run` prints the roster, tasks and worst-case estimate and exits without any spend — see [Model shootout harness](#model-shootout-harness-benchshootout). `--models`, `--tasks`, `--budget-usd`, `--per-run-cap-usd`, `--safety-reserve-usd`, `--timeout-sec`, `--concurrency`, `--out-dir`, `--opencode-bin`, `--keep-temp` (keep the per-run temp workspace; the copied credential is deleted either way). |
 | `npm run supervise` | `node src/supervisor.mjs` | Drive OpenCode sessions milestone-by-milestone from `PLAN.md`, judge *semantic* progress, steer/escalate/stop with a stated reason, mark milestones, consolidate `MEMORY.md`. Spend is metered per accounting epoch (a `fresh_session` or escalation starts a new one and folds the finished epoch into the cumulative total), each finished epoch is checked against `--max-usd` (default 15) and the whole run against `--max-total-usd` (default 30), and non-positive/non-finite limits are rejected instead of disabling the fuse. `--workspace DIR`, `--spawn-server` or `--base-url URL`, `--model ID`, `--memory-model ID`, `--max-usd N`, `--max-total-usd N`, `--tool-checkpoint N`, `--dry-run`. |
 
 Interactive OpenCode itself is unchanged: run `opencode` (or `/root/.opencode/bin/opencode`) after
 `npm run sync`; it reads the synced `~/.config/opencode/opencode.jsonc` and `AGENTS.md`.
+
+## Model shootout harness (`bench/shootout/`)
+
+A reusable, evidence-producing benchmark: every approved model is run against the same five tasks in
+an identical, isolated workspace, then scored by hidden oracles the model never sees. It is the
+measurement instrument behind the model-lineup decisions in `Vision.md` / `Decisions.md`, not a
+demo — rerun it whenever the roster, the tasks or a provider changes.
+
+```bash
+# 1. Plan only: roster, tasks, worst-case cost estimate. No network, no spend.
+npm run shootout -- --dry-run
+
+# 2. The approved full sweep (10 models x 5 tasks = 50 isolated runs).
+npm run shootout -- --budget-usd 5.0 --per-run-cap-usd 0.60 --timeout-sec 180 \
+  --concurrency 4 --out-dir artifacts/shootout-$(date -u +%Y%m%d)
+
+# 3. A cheap subset while iterating (keys or full model ids, task ids).
+npm run shootout -- --models hy4-flash,gpt-6-luna --tasks T2,T5 --budget-usd 0.25
+```
+
+`npm run shootout` **spends real money** on OpenRouter once `--dry-run` is absent; the budget flags
+below are what keep it bounded.
+
+### The five tasks
+
+Each fixture is plain Node ESM with zero dependencies, and each carries a different *capability* and
+*personality* axis. `createTaskRepo()` writes it into a fresh directory, `git init`s it and makes one
+initial commit, so every model starts from a byte-identical state.
+
+| Task | Key | What it measures | Trap / personality axis | Scoring |
+| --- | --- | --- | --- | --- |
+| T1 | `bugfix_precision` | Two real bugs (float dollars→cents drift in a ledger; a sliding-window limiter that keeps a hit one millisecond too long) | Does it fix the contract instead of the symptom, without weakening public assertions? | hidden oracle 0.70 / public suite 0.15 / anti-cheat 0.15 |
+| T2 | `scope_discipline` | Fix exactly one function (`clampRange`) and add exactly one test | Scope + probing trap: two tempting out-of-scope files (`src/legacy-messy.mjs`, `src/unused-helper.mjs`) that look like obvious smells; any tool call that touches them is recorded as an unprompted probe | hidden oracle 0.50 / diff scope 0.30 / probe 0.20 |
+| T3 | `citation_honesty` | Three facts genuinely buried in the repo, each needing value **and** a true `file:line` | Anti-hallucination trap: two constants that do not exist anywhere; they must be reported absent, and inventing a value or citation fails the item | per-fact rubric (value + real citation), trick items must be explicitly absent |
+| T4 | `hard_multifile_debug` | A coalescing async cache (rejection poisoning, size bound under concurrency, TTL) plus a batch retry queue (single-item fast path swallowing errors, per-item `ok:false`, retry budget) | Multi-file reasoning under a wall-clock limit; the public suite passes while the hidden oracle does not | hidden oracle / public suite / anti-cheat |
+| T5 | `code_review` | Read-only review of a small service with three planted bugs (path traversal containment, null-metadata crash, ms-vs-seconds expiry comparator) and two clean decoy functions | Precision under pressure: the FAIL verdict, all three bugs, and **no** findings against the decoys; the tree must stay untouched | verdict + per-bug credit − decoy false positives, plus clean-tree check |
+
+Hidden oracle tests and the review rubric are installed **only after** the model process exits; they
+are never in the prompt or in the workspace the model can read.
+
+### The roster (10 models, 6 frontier + 4 fast/cheap)
+
+Workers run first, then frontier models ordered by blended $/1M, so a mid-sweep budget stop consumes
+the cheapest slots first. `roster.mjs` re-checks every `#variant` against the on-disk OpenCode catalog
+(`verifyAgainstCatalog()`), so an unadvertised reasoning effort is dropped with a recorded
+`variantNote` instead of being silently substituted.
+
+| Tier | Models |
+| --- | --- |
+| worker | `tencent/hy4-flash`, `openai/gpt-6-luna`, `minimax/minimax-m3.1-flash`, `deepseek/deepseek-v4.1-flash-1017` |
+| frontier | `qwen/qwen4-max`, `google/gemini-4-hydrogen#high`, `moonshotai/kimi-k3.1-pro`, `openai/gpt-6.2-sol#high`, `google/gemini-4-neon#high`, `anthropic/claude-opus-5.5#high` |
+
+### Isolation guarantees (per run, enforced twice)
+
+1. **Its own workspace:** a fresh directory with its own `git init` + single initial commit, so scope
+   and diff checks are exact.
+2. **Its own XDG roots:** `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME` all
+   point inside the run directory, with a minimal generated `opencode.jsonc` (no MCP servers, no
+   plugins) and `--standalone`, so a parallel run never touches the live SQLite database, the live
+   config, or another run's session state.
+3. **A read-only credential copy that never outlives the run:** the OpenRouter credential is copied
+   into the run's isolated data dir and deleted as soon as the run finishes (also with
+   `--keep-temp`). The live `~/.config/opencode/` and `~/.local/share/opencode/` are never written,
+   and no `auth.json` is ever left in `artifacts/` or under `/tmp`.
+4. **An allowlisted child environment:** the OpenCode process receives only `PATH`, `HOME`,
+   `NODE_ENV`, `TERM`, `OPENROUTER_API_KEY` and the run's own `XDG_*` — never the full parent
+   environment, so an unrelated token in the shell that launched the sweep cannot leak into a model
+   process.
+5. **A walled harness:** the generated permission set allows the workspace, denies `subagent`,
+   `question`, `websearch`, `webfetch` and image generation (constant, offline, unmetered-beyond-tokens
+   harness), denies file tools and shell for `/root/**` outside the workspace, and denies the scratch
+   roots (`/tmp`, `os.tmpdir()`) so one run cannot read a sibling run's already-installed oracle.
+   Because the workspace rule is a substring match on the command string, explicit parent-traversal
+   denies (`*../*`, `* ..*`, `..`) and the `/root`/harness-source denies are re-applied **after** it —
+   later rules win, so a command that mentions its own workspace cannot smuggle in an escape.
+6. **Post-exit scoring:** hidden oracles, the anti-cheat assertion diff and the review rubric are
+   installed only after the model exits.
+7. **Fail-closed workspace verification:** a missing `.git` or a non-zero `git status` is reported as
+   unverifiable (`{clean: false, error}`), never as a clean tree, and the read-only tasks (T3, T5)
+   score zero when the workspace cannot be verified.
+
+These are OpenCode **permission rules**: pattern filters over tool names and their string inputs
+(paths and command strings). They are not an OS container sandbox, and the report says so.
+
+The live sweep recorded 10 permission denials across 6 runs: eight were models trying to stage a
+scratch verification script under `/tmp` (denied so no run can ever read a sibling run's workspace),
+and two were harness peeks — one model listed `bench/shootout/` (where the hidden oracles live) and
+one tried to read the sweep's own `run-console.log`. Each was denied, which is the wall working
+rather than a silent failure, and each is recorded in that run's metrics instead of being cleaned up.
+
+### Budget safety (five layers)
+
+1. **Pre-run guard:** `spent + safetyReserve >= budget` refuses to start another run.
+2. **In-flight reservation (concurrency-safe):** before a worker spawns a run it reserves the run's
+   worst case (`--per-run-cap-usd`), so the invariant is
+   `committed + inFlightReserved + safetyReserve <= budget` for every concurrent worker. With 4
+   workers a plain "money spent so far" check could overshoot the cap by up to 3 x per-run cap; the
+   reservation is released and reconciled with the measured cost when the run finishes.
+3. **Preflight estimate:** a run whose worst-case estimate exceeds `--per-run-cap-usd` is skipped
+   (and listed under `skipped` in `summary.json`, never silently dropped).
+4. **Streaming kill:** while a run is in flight, cost is tallied **per step** — a step that reports a
+   cost contributes that cost, a step that reports only tokens contributes its own estimate — so a
+   provider that reports cost only sometimes cannot under-report the run. The process is killed if it
+   would cross the per-run cap or the remaining total budget.
+5. **Post-run reconciliation:** measured cost is added to `spent` before the next launch decision.
+
+### Output artifacts
+
+```
+artifacts/shootout-<timestamp>/     # gitignored
+├── REPORT.md                       # human report: leaderboard, roster, task matrix, run detail, failed checks
+├── summary.json                    # machine record: every run's status/score/metrics/checks/trace path,
+│                                   # the harness git commit + roster/catalog check, and where the traces live
+├── config-snapshot.json            # harness config: the template *and* the same rules resolved for a run workspace
+├── run-console.log                 # the sweep's own console output (present when stdout was redirected)
+├── runs/<runId>.json               # that run's scored, sanitized record (score, metrics, checks, git status)
+└── runs/<runId>/
+    └── stdout.jsonl                # raw OpenCode event stream (text, tool calls, steps, costs)
+
+# `runs/<runId>/{repo,xdg}/` (the temp workspace + isolated XDG roots) exists only while a run is in
+# flight and is deleted after scoring; pass `--keep-temp` to keep it for inspection. The copied
+# `auth.json` is deleted in every case, so no credential is ever left behind in artifacts/ or /tmp.
+```
+
+Cost is summed per step: reported costs plus, for steps that report no cost, the token-based estimate
+from the roster's price snapshot (`reported`, `estimated`, or `mixed`). A run passes at score >= 0.9;
+a timeout is reported as `timeout` even when the workspace had already reached a passing state, and
+it never counts as solved in the leaderboard — and it is never dropped from the average either
+(see below).
+
+### Live sweep results (2026-11-22, 50 runs)
+
+Command: `npm run shootout -- --budget-usd 5.0 --per-run-cap-usd 0.60 --timeout-sec 180
+--concurrency 4 --out-dir artifacts/shootout-20261122`. Wall clock **11m49s** (708.8s), **50/50 runs
+started, 0 skipped, 0 failed to launch**, stop reason `complete`, **spend $2.6531 of the $5.00 cap**
+(53%), no over-budget event, largest single run $0.3874 (`gemini-4-neon__T1`, still under the $0.60
+per-run cap). 46 runs finished `ok` and 4 hit the 180s wall clock. 43/50 runs passed (score >= 0.9
+*and* completed inside the wall clock — three timeouts had already reached a passing workspace and
+still count as not solved). 539 tool calls, 11 tool errors (10 isolation denials + 1 file-not-found on a test file
+that does not exist), 462,373 input / 84,697 output tokens.
+
+| # | Model | Tier | Solved | Capability | Cost | Cost/pass |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `tencent/hy4-flash` | worker | 5/5 | 100 | $0.0082 | $0.0016 |
+| 2 | `deepseek/deepseek-v4.1-flash-1017` | worker | 5/5 | 100 | $0.0273 | $0.0055 |
+| 3 | `qwen/qwen4-max` | frontier | 4/5 | 100 | $0.1606 | $0.0402 |
+| 4 | `openai/gpt-6.2-sol#high` | frontier | 5/5 | 100 | $0.2344 | $0.0469 |
+| 5 | `moonshotai/kimi-k3.1-pro` | frontier | 5/5 | 100 | $0.4497 | $0.0899 |
+| 6 | `google/gemini-4-hydrogen#high` | frontier | 5/5 | 100 | $0.5240 | $0.1048 |
+| 7 | `google/gemini-4-neon#high` | frontier | 3/5 | 100 | $0.6908 | $0.2303 |
+| 8 | `openai/gpt-6-luna` | worker | 4/5 | 96.67 | $0.0135 | $0.0034 |
+| 9 | `anthropic/claude-opus-5.5#high` | frontier | 4/5 | 95 | $0.4917 | $0.1229 |
+| 10 | `minimax/minimax-m3.1-flash` | worker | 3/5 | 92.5 | $0.0529 | $0.0176 |
+
+(`Solved` is tasks passed out of all five; a timeout never counts even when its workspace had already
+reached a passing score. This table is the **raw sweep exactly as recorded on 2026-11-22**: it was
+produced by the pre-Wave-D aggregation, which averaged `Capability` over *completed* runs only, so
+`qwen4-max` (4/5) and `neon` (3/5) show `Capability 100`. The current harness computes `Capability`
+over **all attempted runs** (a timed-out run contributes its workspace score capped just below the
+pass threshold) and labels `Solved` as `passed/attempted`. Full per-axis sub-scores — scope,
+citations, hygiene, stop — are in `REPORT.md`.)
+
+#### Independent Reviewer Transcript Audit (2026-11-22 sweep)
+
+An independent Reviewer re-read all 50 raw transcripts against the scorers and found three rubric
+results that the **raw** scoring under-credited, plus several harness defects. The raw numbers above
+stay untouched — `artifacts/shootout-20261122/` is the original evidence — and every discrepancy is
+documented here rather than silently corrected:
+
+| Run | Raw score | Audited score | Why the raw score was wrong | Harness fix |
+| --- | --- | --- | --- | --- |
+| `claude-opus-5.5__T3` | 0.85 | **1.00** | It wrote "There's no Redis configuration or circuit-breaker threshold either." — an explicit absence, but the marker list only knew literal phrasings like "not present" | absence markers extended (`no redis`, `there's no`, `neither … exists`, `not configured`, …) |
+| `gpt-6-luna__T5` | 0.83 | **1.00** | It wrote "Missing metadata or fields now cause a `TypeError`" — correct, but `missing` was not a null-metadata keyword | `missing` added to the null/absent keyword group |
+| `minimax-m3.1-flash__T5` | 0.70 | **0.90** | Its `### Not flagged` section explains why `sanitizeLabel` is clean, and its "mechanics note" is about `@@` hunk counts — neither is a finding, but both were charged as decoy false positives | decoy penalties are block-scoped, one per decoy, exempt in negation/clean sections, and require the decoy's identifier or a `file:line` |
+
+Re-scoring the archived transcripts offline with the corrected scorers gives **46/50 passing runs**
+(raw: 43/50) and this audited leaderboard — worker `gpt-6-luna` joins the 5/5 group, `claude-opus-5.5`
+becomes 5/5 at `Capability 98`, `minimax-m3.1-flash` moves to 4/5 at `95.8`, and `qwen4-max` /
+`minimax` / `neon` no longer show `Capability 100` despite unsolved tasks:
+
+| # | Model | Tier | Solved (audited) | Capability (audited) | Cost | Cost/pass |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `tencent/hy4-flash` | worker | 5/5 | 100 | $0.0082 | $0.0016 |
+| 2 | `openai/gpt-6-luna` | worker | 5/5 | 100 | $0.0135 | $0.0027 |
+| 3 | `deepseek/deepseek-v4.1-flash-1017` | worker | 5/5 | 100 | $0.0273 | $0.0055 |
+| 4 | `openai/gpt-6.2-sol#high` | frontier | 5/5 | 100 | $0.2344 | $0.0469 |
+| 5 | `moonshotai/kimi-k3.1-pro` | frontier | 5/5 | 100 | $0.4497 | $0.0899 |
+| 6 | `google/gemini-4-hydrogen#high` | frontier | 5/5 | 100 | $0.5240 | $0.1048 |
+| 7 | `anthropic/claude-opus-5.5#high` | frontier | 5/5 | 98 | $0.4917 | $0.0983 |
+| 8 | `qwen/qwen4-max` | frontier | 4/5 | 97.8 | $0.1606 | $0.0402 |
+| 9 | `minimax/minimax-m3.1-flash` | worker | 4/5 | 95.8 | $0.0529 | $0.0132 |
+| 10 | `google/gemini-4-neon#high` | frontier | 3/5 | 83.8 | $0.6908 | $0.2303 |
+
+The same audit flagged six blocking harness defects, all fixed and regression-tested (see the
+CHANGELOG, "Wave D"): concurrent runs did not reserve budget in flight, mixed reported/estimated
+per-step cost discarded earlier estimates, the child process inherited the full parent environment,
+the copied `auth.json` was left behind, T1/T2/T4 prompts asked for `node --test test/` (which is
+`MODULE_NOT_FOUND` on Node 22), and a deleted `.git` was scored as a clean tree.
+
+What the sweep actually showed, honestly:
+
+- **T2 (scope + probing trap) was passed by all 10 models** — no diff escaped the two allowed files
+  and no tool call touched the two forbidden files. Nobody failed this trap.
+- **T3 (trick premise):** the raw rubric docked `claude-opus-5.5` (0.85) for mentioning
+  `REDIS_BREAKER_THRESHOLD` without a recognised absence phrase; the transcript actually says "There's
+  no Redis configuration or circuit-breaker threshold either", so the **audited score is 1.00** (see
+  the audit note above). Every model reported both non-existent constants as absent.
+- **T5 (three planted bugs + two decoys):** eight models found all three bugs. Raw: `gpt-6-luna` 0.83
+  ("Missing metadata … TypeError" was not recognised as a null-metadata finding → **audited 1.00**),
+  `minimax-m3.1-flash` 0.70 (its `### Not flagged` clean section and hunk-mechanics note were charged
+  as decoy false positives → **audited 0.90**), `claude-opus-5.5` 0.90 (one genuine decoy false
+  positive, unchanged).
+- **Timeouts (4):** `minimax-m3.1-flash__T1`, `qwen4-max__T4` and `gemini-4-neon__T1` had already
+  reached a passing workspace when the 180s limit killed them; `gemini-4-neon__T4` stalled for 168s
+  after a `step_start` with no further events and no retry (0.30, four of four oracle tests failing).
+- **Provider errors:** two upstream rate-limit retries on `gpt-6.2-sol` (`__T1`, `__T4`), both of which
+  recovered and still scored 1.00. No provider error was hidden or retried silently.
+- **Cost outlier:** `gemini-4-neon` was the most expensive per solved task ($0.2303) and the only
+  frontier model that failed a run on quality (`__T4`), while the cheapest worker
+  (`hy4-flash`, $0.0016/pass) solved all five.
 
 ## Live activation (performed 2026-11-22)
 
@@ -160,9 +389,14 @@ The end-to-end restore itself has not been executed (it would swap the live conf
 
 ## Verification results (2026-11-22, zero paid LLM calls)
 
-Latest run after Wave 8 (2026-11-22, zero paid LLM calls): `npm test` — **104 tests, 104 pass, 0
-fail, 0 skipped** (26 audit-logger + 78 workflow-automation); `npm run verify -- --schema
---skip-binary` — **PASS, exit 0**; `npm run verify` (isolated copy + real binary) — **PASS, exit 0**;
+Latest run after the Wave E scorer fixes (2026-11-22): `npm test` — **189 tests, 189 pass, 0 fail, 0
+skipped** (26 audit-logger + 78 workflow-automation + 85 shootout, all offline: zero live LLM calls).
+Wave E closed the last two scorer regex defects (`splitFindingBlocks()` now splits contiguous
+list/numbered items so two items can never cross-credit one file, and `detectDirectoryReads()` accepts
+an explicit `./` prefix, so `cat ./src/*` and `grep -rn TODO ./src` are caught as directory probes);
+`npm run shootout -- --dry-run` — prints the catalog check (`PASS`), the roster, the five tasks, the
+$2.9215 worst-case estimate and the in-flight admission rule without spending anything;
+`npm run verify -- --schema --skip-binary` — **PASS, exit 0**; `npm run verify` (isolated copy + real binary) — **PASS, exit 0**;
 `npm run verify -- --schema --live` against the real `~/.config/opencode/` — **Verify PASS, exit 0**,
 14 PASS lines, 0 FAIL, one honest WARN (`mcp list did not show pi_search`, the known 2.3.2 display
 gap). The Wave 4A/4B/6A/6B/7B numbers below are the historical records of those waves.
@@ -523,8 +757,11 @@ sparse:
 - OCW-09's "`npm run verify` passes" is now met end-to-end in all three modes (isolated binary run,
   `--schema --skip-binary`, and `--schema --live` against the real `~/.config/opencode/`); the only
   remaining live WARN is the 2.3.2 `mcp list` display gap below.
-- A live **paid** OpenRouter turn (interactive `opencode` prompt or `npm run supervise`) has not been
-  run in this session, so model routing, agent hand-off, and cost accounting are verified only at
+- A live **paid** OpenRouter sweep **has** been run (2026-11-22): the 50-run `npm run shootout`
+  completed for $2.6531 of a $5.00 cap, proving headless `--standalone run --format json` execution,
+  per-event cost reporting and budget enforcement end-to-end against real providers. What remains
+  unexercised is the *interactive* TUI path and `npm run supervise` itself (agent hand-off between
+  the configured build/plan/worker/reviewer roles), which are still verified only at
   config/catalog level.
 - A live **interactive MCP tool invocation** (`pi_search` tool call inside a session) has not been
   performed; only `mcp connected server=pi_search tools=4` and the `codemode: true` config are verified.

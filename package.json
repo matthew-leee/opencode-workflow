@@ -13,7 +13,8 @@
     "verify": "node scripts/verify-setup.mjs",
     "prune": "node src/rsi-prune.mjs",
     "consolidate": "node src/memory-consolidate.mjs",
-    "supervise": "node src/supervisor.mjs"
+    "supervise": "node src/supervisor.mjs",
+    "shootout": "node bench/shootout/runner.mjs"
   },
   "dependencies": {
     "@opencode/client": "2.3.2",
