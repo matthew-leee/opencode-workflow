@@ -175,7 +175,9 @@
         { "action": "edit", "resource": "/root/.opencode/plan/*", "effect": "allow" },
         { "action": "write", "resource": "/root/.opencode/plan/*", "effect": "allow" },
         { "action": "edit", "resource": "/root/pi-projects/**/PLAN.md", "effect": "allow" },
-        { "action": "write", "resource": "/root/pi-projects/**/PLAN.md", "effect": "allow" }
+        { "action": "write", "resource": "/root/pi-projects/**/PLAN.md", "effect": "allow" },
+        { "action": "edit", "resource": "/root/financeBot/PLAN.md", "effect": "allow" },
+        { "action": "write", "resource": "/root/financeBot/PLAN.md", "effect": "allow" }
       ]
     },
 
