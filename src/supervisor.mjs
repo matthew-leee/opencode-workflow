@@ -324,7 +324,8 @@ async function decide({ ctx, milestone, sessionID, stats, trigger }) {
       model: ctx.model,
       trigger,
     }),
-    maxTokens: 350,
+    maxTokens: 1024,
+    reasoning: { effort: "low" },
     temperature: 0.2,
   };
   try {

@@ -777,6 +777,40 @@ test('Layer 1C: generate.text primary model success is accepted directly', async
   assert.equal(decision.model, 'openrouter/openai/gpt-6-luna');
 });
 
+test('Layer 1C: direct OpenRouter chat fallback sends reasoning effort=low and >=1024 max_tokens', async () => {
+  const seenBodies = [];
+  const config = resolveGuardConfig({
+    decisionModel: null,
+    openrouterApiKey: 'test-key',
+    systemOneEnabled: false,
+    judgeTimeoutMs: 200,
+    fallbackChatModels: [{ providerID: 'openrouter', id: 'openai/gpt-6-luna' }],
+  });
+
+  const decision = await judgeTripwire({
+    tripwire: { kind: 'identical_errors', detail: '3x identical error' },
+    state: makeJudgeState(),
+    chain: makeJudgeChain(),
+    ctx: {},
+    config,
+    fetchImpl: async (url, init) => {
+      seenBodies.push({ url, body: JSON.parse(init.body) });
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"action":"steer","rationale":"repeated error","message":"inspect path"}' } }],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    },
+  });
+
+  assert.equal(decision.action, 'steer');
+  assert.equal(decision.source, 'openrouter_chat');
+  assert.equal(seenBodies.length, 1);
+  assert.ok(seenBodies[0].body.max_tokens >= 1024);
+  assert.deepEqual(seenBodies[0].body.reasoning, { effort: 'low' });
+});
+
 test('Layer 1D: all remote judges failing/malformed falls back deterministically', async () => {
   const config = resolveGuardConfig({
     decisionModel: { providerID: 'baseten', id: 'baseten/bison-1' },

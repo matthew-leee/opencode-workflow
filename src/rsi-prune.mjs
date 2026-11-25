@@ -699,7 +699,14 @@ function extractText(result) {
 async function synthesize(llm, report) {
   if (!llm) return { text: null, error: null };
   try {
-    const request = { purpose: "rsi-synthesis", model: report.synthesisModel, messages: buildSynthesisPrompt(report), maxTokens: 500, temperature: 0.2 };
+    const request = {
+      purpose: "rsi-synthesis",
+      model: report.synthesisModel,
+      messages: buildSynthesisPrompt(report),
+      maxTokens: 2048,
+      reasoning: { effort: "low" },
+      temperature: 0.2,
+    };
     let result;
     if (typeof llm === "function") result = await llm(request);
     else if (typeof llm.chat === "function") result = await llm.chat(request);

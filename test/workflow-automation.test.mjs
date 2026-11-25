@@ -361,9 +361,114 @@ describe("openrouter-client", () => {
       return true;
     });
   });
+
+  test("serializes reasoning option and recovers once when hidden reasoning exhausts max_tokens", async () => {
+    const bodies = [];
+    const fetchImpl = async (_url, init) => {
+      const body = JSON.parse(init.body);
+      bodies.push(body);
+      if (bodies.length === 1) {
+        return new Response(JSON.stringify({
+          model: "deepseek/deepseek-v4.1-flash-1017",
+          choices: [{ finish_reason: "length", message: { content: "", reasoning: "long chain of thought..." } }],
+          usage: { completion_tokens: 1250, completion_tokens_details: { reasoning_tokens: 1250 } },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        model: "deepseek/deepseek-v4.1-flash-1017",
+        choices: [{ finish_reason: "stop", message: { content: "# MEMORY\n\nRecovered cleanly." } }],
+        usage: { completion_tokens: 12, completion_tokens_details: { reasoning_tokens: 0 } },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const client = createOpenRouterClient({ apiKey: "sk-test-secret", fetchImpl, timeoutMs: 1000 });
+    const result = await client.chat({
+      messages: [{ role: "user", content: "consolidate" }],
+      maxTokens: 1250,
+      reasoning: { effort: "low" },
+    });
+    assert.equal(bodies.length, 2);
+    assert.deepEqual(bodies[0].reasoning, { effort: "low" });
+    assert.equal(bodies[0].max_tokens, 1250);
+    assert.deepEqual(bodies[1].reasoning, { enabled: false });
+    assert.equal(bodies[1].max_tokens, 2048);
+    assert.match(result.text, /Recovered cleanly/);
+  });
+
+  test("surfaces diagnostic empty_response error when reasoning-exhaustion retry also fails", async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(JSON.stringify({
+          choices: [{ finish_reason: "length", message: { content: "", reasoning: "thinking" } }],
+          usage: { completion_tokens: 500, completion_tokens_details: { reasoning_tokens: 500 } },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("reasoning.enabled=false unsupported", { status: 400 });
+    };
+    const client = createOpenRouterClient({ apiKey: "sk-test-secret", fetchImpl, timeoutMs: 1000 });
+    await assert.rejects(
+      client.chat({ messages: [{ role: "user", content: "hi" }], maxTokens: 500 }),
+      (error) => {
+        assert.equal(error.code, "empty_response");
+        assert.match(error.message, /finish_reason=length/);
+        assert.match(error.message, /reasoning_tokens=500/);
+        assert.match(error.message, /max_tokens=500/);
+        return true;
+      },
+    );
+    assert.equal(calls, 2);
+
+    // No redundant retry when caller already disabled reasoning with >= 2048 max_tokens.
+    let singleCalls = 0;
+    const singleClient = createOpenRouterClient({
+      apiKey: "sk-test-secret",
+      timeoutMs: 1000,
+      fetchImpl: async () => {
+        singleCalls += 1;
+        return new Response(JSON.stringify({
+          choices: [{ finish_reason: "length", message: { content: "", reasoning: "still" } }],
+          usage: { completion_tokens: 2048, completion_tokens_details: { reasoning_tokens: 2048 } },
+        }), { status: 200 });
+      },
+    });
+    await assert.rejects(
+      singleClient.chat({ messages: [{ role: "user", content: "hi" }], maxTokens: 2048, reasoning: { enabled: false } }),
+      (error) => error.code === "empty_response",
+    );
+    assert.equal(singleCalls, 1);
+  });
 });
 
 describe("memory-consolidate", () => {
+  test("passes generous maxTokens and low reasoning effort to prevent empty thinking-model output", async (t) => {
+    const workspace = tempDir(t);
+    const auditDir = join(workspace, ".audit");
+    writeJsonl(join(auditDir, "audit.jsonl"), [
+      auditEntry({ workspace, session: "s1", type: "session.tool.called", tool: "read" }),
+    ]);
+    const seen = [];
+    const llm = {
+      async chat(req) {
+        seen.push(req);
+        if (req.purpose === "consolidate") return `# MEMORY\n\n${"x".repeat(3000)}`;
+        return "# MEMORY\n\n- Compact summary.\n";
+      },
+    };
+    const res = await consolidateMemory({
+      workspace,
+      auditDirs: [auditDir],
+      llm,
+      dryRun: true,
+      now: Date.parse("2026-11-22T09:00:00Z"),
+    });
+    assert.equal(res.status, "compressed");
+    assert.equal(seen.length, 2);
+    for (const req of seen) {
+      assert.ok(req.maxTokens >= 4096, `expected maxTokens >= 4096 for ${req.purpose}, got ${req.maxTokens}`);
+      assert.deepEqual(req.reasoning, { effort: "low" });
+    }
+  });
   test("enforces the hard 2,500-character ceiling, backs up, and writes atomically", async (t) => {
     const workspace = tempDir(t);
     const auditDir = join(workspace, ".audit");

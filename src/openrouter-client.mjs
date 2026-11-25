@@ -226,6 +226,55 @@ export function createOpenRouterClient(options = {}) {
     });
   }
 
+  async function postChat(body, extraHeaders, signal) {
+    let response;
+    try {
+      response = await fetchImpl(endpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`,
+          ...defaultHeaders,
+          ...(extraHeaders ?? {}),
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (error) {
+      if (signal.aborted) {
+        throw safeError(`OpenRouter request timed out after ${timeoutMs}ms`, { code: "timeout", cause: error });
+      }
+      throw safeError(`OpenRouter request failed: ${error?.message ?? error}`, {
+        code: "network_error",
+        cause: error,
+      });
+    }
+
+    if (!response || typeof response.ok !== "boolean") {
+      throw safeError("OpenRouter returned an invalid response object", { code: "invalid_response" });
+    }
+
+    if (!response.ok) {
+      let detail = "";
+      try {
+        detail = await response.text();
+      } catch {
+        detail = "";
+      }
+      detail = redactSecrets(String(detail).slice(0, MAX_ERROR_BODY_CHARS), apiKey).trim();
+      throw safeError(
+        `OpenRouter HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
+        { code: "http_error", status: response.status },
+      );
+    }
+
+    try {
+      return await response.json();
+    } catch (error) {
+      throw safeError("OpenRouter response was not valid JSON", { code: "invalid_response", cause: error });
+    }
+  }
+
   async function chat(request = {}) {
     const model = request.model ?? defaultModel;
     const messages = normalizeMessages(request.messages);
@@ -233,6 +282,7 @@ export function createOpenRouterClient(options = {}) {
     if (request.temperature !== undefined) body.temperature = request.temperature;
     if (request.maxTokens !== undefined) body.max_tokens = request.maxTokens;
     if (request.responseFormat !== undefined) body.response_format = request.responseFormat;
+    if (request.reasoning !== undefined) body.reasoning = request.reasoning;
     if (request.extraBody && typeof request.extraBody === "object") Object.assign(body, request.extraBody);
 
     const controller = new AbortController();
@@ -245,65 +295,57 @@ export function createOpenRouterClient(options = {}) {
     }
 
     try {
-      let response;
-      try {
-        response = await fetchImpl(endpoint, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${apiKey}`,
-            ...defaultHeaders,
-            ...(request.headers ?? {}),
-          },
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
-      } catch (error) {
-        if (controller.signal.aborted) {
-          throw safeError(`OpenRouter request timed out after ${timeoutMs}ms`, { code: "timeout", cause: error });
-        }
-        throw safeError(`OpenRouter request failed: ${error?.message ?? error}`, {
-          code: "network_error",
-          cause: error,
-        });
+      const payload = await postChat(body, request.headers, controller.signal);
+      const choice = payload?.choices?.[0];
+      const content = normalizeContent(choice?.message?.content);
+      if (content.trim().length > 0) {
+        return {
+          text: content,
+          model: payload?.model ?? model,
+          usage: payload?.usage ?? null,
+          raw: payload,
+        };
       }
 
-      if (!response || typeof response.ok !== "boolean") {
-        throw safeError("OpenRouter returned an invalid response object", { code: "invalid_response" });
-      }
+      const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : "";
+      const reasoningTokens = Number(payload?.usage?.completion_tokens_details?.reasoning_tokens ?? 0) || 0;
+      const hasReasoning = Boolean(choice?.message?.reasoning);
+      const exhaustedByReasoning = finishReason === "length" && (reasoningTokens > 0 || hasReasoning);
 
-      if (!response.ok) {
-        let detail = "";
+      // Thinking models can spend the entire max_tokens budget on hidden reasoning and return empty content.
+      // Recover once within the same timeout deadline by disabling reasoning and ensuring headroom.
+      const alreadyDisabledWithHeadroom =
+        body.reasoning?.enabled === false && Number(body.max_tokens ?? 0) >= 2048;
+      if (exhaustedByReasoning && request.retryOnReasoningExhaustion !== false && !alreadyDisabledWithHeadroom) {
+        const retryBody = {
+          ...body,
+          reasoning: { enabled: false },
+          max_tokens: Math.max(Number(body.max_tokens) || 0, 2048),
+        };
         try {
-          detail = await response.text();
-        } catch {
-          detail = "";
+          const retryPayload = await postChat(retryBody, request.headers, controller.signal);
+          const retryContent = normalizeContent(retryPayload?.choices?.[0]?.message?.content);
+          if (retryContent.trim().length > 0) {
+            return {
+              text: retryContent,
+              model: retryPayload?.model ?? model,
+              usage: retryPayload?.usage ?? null,
+              raw: retryPayload,
+            };
+          }
+        } catch (retryError) {
+          if (retryError?.code === "timeout") throw retryError;
+          // Fall through so models that reject `reasoning.enabled: false` still surface the original empty_response.
         }
-        detail = redactSecrets(String(detail).slice(0, MAX_ERROR_BODY_CHARS), apiKey).trim();
-        throw safeError(
-          `OpenRouter HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
-          { code: "http_error", status: response.status },
-        );
       }
 
-      let payload;
-      try {
-        payload = await response.json();
-      } catch (error) {
-        throw safeError("OpenRouter response was not valid JSON", { code: "invalid_response", cause: error });
-      }
-
-      const content = normalizeContent(payload?.choices?.[0]?.message?.content);
-      if (content.trim().length === 0) {
-        throw safeError("OpenRouter response contained no message content", { code: "empty_response" });
-      }
-
-      return {
-        text: content,
-        model: payload?.model ?? model,
-        usage: payload?.usage ?? null,
-        raw: payload,
-      };
+      const details = [];
+      if (finishReason) details.push(`finish_reason=${finishReason}`);
+      if (reasoningTokens > 0) details.push(`reasoning_tokens=${reasoningTokens}`);
+      else if (hasReasoning) details.push("reasoning_present=true");
+      if (body.max_tokens !== undefined) details.push(`max_tokens=${body.max_tokens}`);
+      const suffix = details.length > 0 ? ` (${details.join(", ")})` : "";
+      throw safeError(`OpenRouter response contained no message content${suffix}`, { code: "empty_response" });
     } finally {
       clearTimeout(timer);
       if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);

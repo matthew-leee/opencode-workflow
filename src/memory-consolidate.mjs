@@ -952,11 +952,15 @@ export async function consolidateMemory(options = {}) {
     throw new Error("No consolidation model supplied (pass `llm` or set OPENROUTER_API_KEY)");
   }
 
+  // Leave generous headroom above maxChars so thinking models (e.g. deepseek-v4.1-flash)
+  // never exhaust max_tokens on reasoning tokens before emitting the markdown body.
+  const completionMaxTokens = Math.max(4096, Math.ceil(maxChars * 2));
   let attempt = await callModelText(llm, {
     purpose: "consolidate",
     model,
     messages,
-    maxTokens: Math.ceil(maxChars / 2),
+    maxTokens: completionMaxTokens,
+    reasoning: { effort: "low" },
   });
   let content = normalizeMemoryMarkdown(attempt);
   if (!content) throw new EmptyConsolidationError();
@@ -969,7 +973,8 @@ export async function consolidateMemory(options = {}) {
         purpose: "compress",
         model,
         messages: buildCompressionMessages({ current: content, maxChars }),
-        maxTokens: Math.ceil(maxChars / 2),
+        maxTokens: completionMaxTokens,
+        reasoning: { effort: "low" },
       });
       const compressed = normalizeMemoryMarkdown(retry);
       if (compressed) content = compressed;
