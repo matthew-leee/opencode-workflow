@@ -24,38 +24,59 @@
   },
 
   // Ordered rules — later rules win. Everyday inspection/test/build stays silent.
-  // Concise static baseline here; structured shell command parsing (real `.env` secrets,
-  // destructive local ops, remote/infra/DB mutations, while staying silent on `.env.example`
-  // and `process.env` in code) runs in `plugins/audit-logger/permission-guard.js` via
-  // `permission.hook("evaluate")`.
+  // Concise static baseline here; structured shell & file secret protection (real `.env`
+  // secrets and credentials -> immediate `deny` so AFK runs never stall; destructive local
+  // and remote/infra/DB mutations -> `ask` on primary agents, `deny` on subagents; while
+  // staying silent on `.env.example` and `process.env` in code) runs in
+  // `plugins/audit-logger/permission-guard.js` via `permission.hook("evaluate")`.
   "permissions": [
     { "action": "*", "resource": "*", "effect": "allow" },
 
-    // Secret files on single-path file tools (unambiguous path globs).
-    { "action": "read", "resource": "*.env", "effect": "ask" },
-    { "action": "read", "resource": "*.env.*", "effect": "ask" },
-    { "action": "edit", "resource": "*.env", "effect": "ask" },
-    { "action": "edit", "resource": "*.env.*", "effect": "ask" },
-    { "action": "write", "resource": "*.env", "effect": "ask" },
-    { "action": "write", "resource": "*.env.*", "effect": "ask" },
-    { "action": "patch", "resource": "*.env", "effect": "ask" },
-    { "action": "patch", "resource": "*.env.*", "effect": "ask" },
-    { "action": "read", "resource": "*id_rsa*", "effect": "ask" },
-    { "action": "read", "resource": "*id_ed25519*", "effect": "ask" },
-    { "action": "read", "resource": "*.pem", "effect": "ask" },
-    { "action": "read", "resource": "*/secrets/*", "effect": "ask" },
+    // Secret files on single-path file tools -> immediate `deny` (never stalls AFK runs).
+    { "action": "read", "resource": "*.env", "effect": "deny" },
+    { "action": "read", "resource": "*.env.*", "effect": "deny" },
+    { "action": "edit", "resource": "*.env", "effect": "deny" },
+    { "action": "edit", "resource": "*.env.*", "effect": "deny" },
+    { "action": "write", "resource": "*.env", "effect": "deny" },
+    { "action": "write", "resource": "*.env.*", "effect": "deny" },
+    { "action": "patch", "resource": "*.env", "effect": "deny" },
+    { "action": "patch", "resource": "*.env.*", "effect": "deny" },
+    { "action": "read", "resource": "*id_rsa*", "effect": "deny" },
+    { "action": "edit", "resource": "*id_rsa*", "effect": "deny" },
+    { "action": "write", "resource": "*id_rsa*", "effect": "deny" },
+    { "action": "patch", "resource": "*id_rsa*", "effect": "deny" },
+    { "action": "read", "resource": "*id_ed25519*", "effect": "deny" },
+    { "action": "edit", "resource": "*id_ed25519*", "effect": "deny" },
+    { "action": "write", "resource": "*id_ed25519*", "effect": "deny" },
+    { "action": "patch", "resource": "*id_ed25519*", "effect": "deny" },
+    { "action": "read", "resource": "*.pem", "effect": "deny" },
+    { "action": "edit", "resource": "*.pem", "effect": "deny" },
+    { "action": "write", "resource": "*.pem", "effect": "deny" },
+    { "action": "patch", "resource": "*.pem", "effect": "deny" },
+    { "action": "read", "resource": "*/secrets/*", "effect": "deny" },
+    { "action": "edit", "resource": "*/secrets/*", "effect": "deny" },
+    { "action": "write", "resource": "*/secrets/*", "effect": "deny" },
+    { "action": "patch", "resource": "*/secrets/*", "effect": "deny" },
+    { "action": "read", "resource": "*/opencode/service.json", "effect": "deny" },
+    { "action": "edit", "resource": "*/opencode/service.json", "effect": "deny" },
+    { "action": "write", "resource": "*/opencode/service.json", "effect": "deny" },
+    { "action": "patch", "resource": "*/opencode/service.json", "effect": "deny" },
+    { "action": "read", "resource": "*/opencode/auth.json", "effect": "deny" },
+    { "action": "edit", "resource": "*/opencode/auth.json", "effect": "deny" },
+    { "action": "write", "resource": "*/opencode/auth.json", "effect": "deny" },
+    { "action": "patch", "resource": "*/opencode/auth.json", "effect": "deny" },
 
-    // Template escape hatch for single-path file tools only (declared after the ask rules).
+    // Template escape hatch for single-path file tools only (declared after the deny rules).
     { "action": "read", "resource": "*.env.example", "effect": "allow" },
     { "action": "edit", "resource": "*.env.example", "effect": "allow" },
     { "action": "write", "resource": "*.env.example", "effect": "allow" },
     { "action": "patch", "resource": "*.env.example", "effect": "allow" },
 
     // Fail-closed static fallbacks if plugins are ever disabled (high-impact destructive/remote
-    // ops plus shell `.env*`). At runtime, `permission-guard.js` parses shell commands cleanly:
-    // asks on real `.env`/`.env.local` and all destructive/remote/infra/DB mutations, while
-    // overriding the static `*.env*` fallback to `allow` ONLY when every `.env` token is a safe
-    // template (`.env.example`) or code identifier (`process.env`).
+    // ops plus shell `.env*`). Note: shell `*.env*` stays `ask` statically so the plugin can
+    // allow verified `.env.example`/`process.env` without ever weakening an explicit `deny`;
+    // at runtime, `permission-guard.js` upgrades real/unaccounted secrets to `deny` (all agents)
+    // and destructive/remote/infra/DB mutations to `deny` on subagents (`ask` on primary agents).
     { "action": "shell", "resource": "rm -rf*", "effect": "ask" },
     { "action": "bash", "resource": "rm -rf*", "effect": "ask" },
     { "action": "shell", "resource": "git push*", "effect": "ask" },

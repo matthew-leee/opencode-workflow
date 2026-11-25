@@ -274,8 +274,8 @@ test('BoundedSeenSet evicts oldest IDs once limit is exceeded', () => {
 // 2. Structured JS shell & secret permission evaluator
 // ============================================================================
 
-test('permission-guard: real .env & secrets ALWAYS ask, while .env.example & process.env stay silent', () => {
-  const mustAskSecrets = [
+test('permission-guard: real .env & secrets ALWAYS deny, while .env.example & process.env stay silent', () => {
+  const mustDenySecrets = [
     'cat .env',
     'cat ./.env',
     'cat ../api/.env',
@@ -298,12 +298,16 @@ test('permission-guard: real .env & secrets ALWAYS ask, while .env.example & pro
     'cat /app/secrets/stripe.txt',
     'cat ~/.aws/credentials',
     'cat ~/.local/share/opencode/auth.json',
+    'stat -c \'%y %n\' /root/.config/opencode/service.json',
     'bash -c "cat .env"',
   ];
 
-  for (const cmd of mustAskSecrets) {
+  for (const cmd of mustDenySecrets) {
     const verdict = evaluateShellCommand(cmd);
-    assert.equal(verdict.ask, true, `expected ASK for secret command: ${cmd}`);
+    assert.equal(verdict.ask, true, `expected guard hit for secret command: ${cmd}`);
+    assert.equal(verdict.deny, true, `expected DENY for secret command: ${cmd}`);
+    assert.equal(verdict.effect, 'deny', `expected effect=deny for secret command: ${cmd}`);
+    assert.equal(verdict.category, 'secret', `expected category=secret for: ${cmd}`);
   }
 
   const mustAllowBenignEnv = [
@@ -324,6 +328,8 @@ test('permission-guard: real .env & secrets ALWAYS ask, while .env.example & pro
   for (const cmd of mustAllowBenignEnv) {
     const verdict = evaluateShellCommand(cmd);
     assert.equal(verdict.ask, false, `expected ALLOW for benign command: ${cmd} (got ${verdict.reason})`);
+    assert.equal(verdict.deny, false, `expected deny=false for benign command: ${cmd}`);
+    assert.equal(verdict.effect, 'allow', `expected effect=allow for benign command: ${cmd}`);
   }
 });
 
@@ -407,7 +413,7 @@ test('permission-guard: destructive local and remote/infra/DB mutations ask; rea
   }
 });
 
-test('permission-guard: never weakens deny, overrides static *.env* fallback on safe commands, fails closed on syntax errors', () => {
+test('permission-guard: never weakens deny, denies secrets and subagent prompts, overrides static *.env* fallback on safe commands, fails closed on syntax errors', () => {
   // 1. NEVER weaken deny (read-only agent protection)
   const denied = { action: 'shell', resources: ['cat .env.example'], effect: 'deny' };
   const resDeny = evaluatePermissionInput(denied);
@@ -415,34 +421,105 @@ test('permission-guard: never weakens deny, overrides static *.env* fallback on 
   assert.equal(resDeny.overridden, false);
 
   // 2. Override static *.env* fallback `ask -> allow` for `.env.example` and `process.env`
-  const safeExample = { action: 'shell', resources: ['cat .env.example', 'grep -rn "process.env" lib'], effect: 'ask' };
+  const safeExample = { action: 'shell', agent: 'build', resources: ['cat .env.example', 'grep -rn "process.env" lib'], effect: 'ask' };
   const resExample = evaluatePermissionInput(safeExample);
   assert.equal(safeExample.effect, 'allow');
   assert.equal(resExample.overridden, true);
 
-  // 3. Keep `ask` when a real `.env` is mixed with `.env.example`
-  const mixed = { action: 'shell', resources: ['cat .env.example', 'cat .env # .env.example'], effect: 'ask' };
-  evaluatePermissionInput(mixed);
-  assert.equal(mixed.effect, 'ask');
+  // 2b. Safe templates/identifiers ALSO stay silent for subagents
+  const safeWorkerExample = { action: 'shell', agent: 'worker', resources: ['cat .env.example', 'grep -rn "process.env" lib'], effect: 'ask' };
+  evaluatePermissionInput(safeWorkerExample);
+  assert.equal(safeWorkerExample.effect, 'allow');
 
-  // 4. Escalate `allow -> ask` on `git push` even if baseline/saved rule gave `allow`
-  const push = { action: 'shell', resources: ['git push origin main'], effect: 'allow' };
+  // 3. Upgrade `ask -> deny` when a real `.env` is mixed with `.env.example` (never stalls AFK)
+  const mixed = { action: 'shell', agent: 'build', resources: ['cat .env.example', 'cat .env # .env.example'], effect: 'ask' };
+  const resMixed = evaluatePermissionInput(mixed);
+  assert.equal(mixed.effect, 'deny');
+  assert.equal(resMixed.overridden, true);
+  assert.equal(resMixed.category, 'secret');
+
+  // 3b. Secret precedence: secrets ALWAYS deny even when preceded by destructive/remote/wrapper hits
+  for (const cmd of [
+    'rm -rf /tmp/x && cat .env',
+    'git push origin main && echo $(cat .env)',
+    'sudo cat .env',
+    'sudo cat /root/.config/opencode/service.json',
+    'eval "cat .env"',
+    'echo hi | bash -c "cat .env"',
+  ]) {
+    const inp = { action: 'shell', agent: 'build', resources: [cmd], effect: 'allow' };
+    const r = evaluatePermissionInput(inp);
+    assert.equal(inp.effect, 'deny', `secret must take precedence (deny) for: ${cmd}`);
+    assert.equal(r.category, 'secret', `expected category=secret for: ${cmd}`);
+  }
+  const multiRes = { action: 'shell', agent: 'build', resources: ['git push origin main', 'cat .env'], effect: 'allow' };
+  evaluatePermissionInput(multiRes);
+  assert.equal(multiRes.effect, 'deny', 'secret in a later resource must take precedence over earlier ask');
+
+  // 3c. Defense in depth on single-path file tools (even when worker has `edit * allow`)
+  const workerEditEnv = { action: 'edit', agent: 'worker', resources: ['.env'], effect: 'allow' };
+  evaluatePermissionInput(workerEditEnv);
+  assert.equal(workerEditEnv.effect, 'deny');
+
+  const readServiceJson = { action: 'read', agent: 'build', resources: ['/root/.config/opencode/service.json'], effect: 'allow' };
+  evaluatePermissionInput(readServiceJson);
+  assert.equal(readServiceJson.effect, 'deny');
+
+  for (const normPath of [
+    '/root/.config/opencode/./auth.json',
+    '/root/.config/opencode/sub/../service.json',
+    '/root/.config//opencode//service.json',
+  ]) {
+    const inp = { action: 'read', agent: 'build', resources: [normPath], effect: 'allow' };
+    evaluatePermissionInput(inp);
+    assert.equal(inp.effect, 'deny', `normalized secret path must deny: ${normPath}`);
+  }
+
+  const workerEditExample = { action: 'edit', agent: 'worker', resources: ['.env.example'], effect: 'allow' };
+  evaluatePermissionInput(workerEditExample);
+  assert.equal(workerEditExample.effect, 'allow');
+
+  // 4. Escalate `allow -> ask` on `git push` for primary agents even if baseline/saved rule gave `allow`
+  const push = { action: 'shell', agent: 'build', resources: ['git push origin main'], effect: 'allow' };
   const resPush = evaluatePermissionInput(push);
   assert.equal(push.effect, 'ask');
   assert.equal(resPush.overridden, true);
   assert.match(push.message, /git push/i);
 
-  // 5. Fail closed on unclosed quote / oversized command
-  const unclosed = { action: 'shell', resources: ['cat ".env.example'], effect: 'ask' };
+  // 4a. Rotated primary `build` session (rootSessionID !== sessionID -> isChildSession: true) stays primary (`ask`)
+  const rotatedBuildPush = { action: 'shell', agent: 'build', resources: ['git push origin main'], effect: 'allow' };
+  evaluatePermissionInput(rotatedBuildPush, { agent: 'build', isChildSession: true });
+  assert.equal(rotatedBuildPush.effect, 'ask', 'rotated primary build session must remain primary (ask)');
+
+  // 4b. Escalate destructive/remote/infra ops to `deny` on subagents so background runs never stall AFK
+  for (const sub of ['worker', 'escalate-opus', 'escalate-fable', 'reviewer']) {
+    const subPush = { action: 'shell', agent: sub, resources: ['git push origin main'], effect: 'allow' };
+    const subRes = evaluatePermissionInput(subPush);
+    assert.equal(subPush.effect, 'deny', `subagent ${sub} must deny git push`);
+    assert.equal(subRes.overridden, true);
+    assert.match(subPush.message, /never stall/i);
+  }
+
+  // 5. Fail closed on unclosed quote / oversized command (ask on primary, deny on subagent,
+  //    and deny even on primary when the malformed command references a real secret!)
+  const unclosed = { action: 'shell', agent: 'build', resources: ['cat ".env.example'], effect: 'ask' };
   evaluatePermissionInput(unclosed);
   assert.equal(unclosed.effect, 'ask');
 
-  const huge = { action: 'shell', resources: ['echo ' + 'a'.repeat(70_000)], effect: 'allow' };
+  const unclosedRealSecret = { action: 'shell', agent: 'build', resources: ['cat .env "unterminated'], effect: 'ask' };
+  evaluatePermissionInput(unclosedRealSecret);
+  assert.equal(unclosedRealSecret.effect, 'deny');
+
+  const unclosedSub = { action: 'shell', agent: 'worker', resources: ['cat ".env.example'], effect: 'ask' };
+  evaluatePermissionInput(unclosedSub);
+  assert.equal(unclosedSub.effect, 'deny');
+
+  const huge = { action: 'shell', agent: 'build', resources: ['echo ' + 'a'.repeat(70_000)], effect: 'allow' };
   evaluatePermissionInput(huge);
   assert.equal(huge.effect, 'ask');
 
-  // 6. Preserve existing message when already `ask`
-  const preMsg = { action: 'bash', resources: ['rm -rf /tmp/x'], effect: 'ask', message: 'needs approval' };
+  // 6. Preserve existing message when already `ask` on primary agent
+  const preMsg = { action: 'bash', agent: 'build', resources: ['rm -rf /tmp/x'], effect: 'ask', message: 'needs approval' };
   evaluatePermissionInput(preMsg);
   assert.equal(preMsg.effect, 'ask');
   assert.equal(preMsg.message, 'needs approval');
@@ -839,7 +916,7 @@ test('opencode-db reader + rsi-prune + memory-consolidate: dedupes 5x eventIDs, 
 // ============================================================================
 
 test(
-  'live isolated OpenCode server: real plugin allows .env.example/process.env and forces ask on .env and git push even after saved "always"',
+  'live isolated OpenCode server: real plugin allows .env.example/process.env, denies secrets & subagent prompts, and enforces ask on primary git push even after saved "always"',
   { timeout: 60_000 },
   async (t) => {
     if (!fs.existsSync(OPENCODE_BIN)) {
@@ -922,18 +999,75 @@ test(
     });
     assert.equal(pProcessEnv.effect, 'allow', 'grep process.env should be allowed by JS evaluator');
 
-    // 2. Real `.env` and comment-bypass commands MUST ask!
+    // 2. Real `.env`, comment-bypass, and OpenCode credential files MUST deny immediately (never stall AFK)!
     const pRealEnv = await client.permission.create({
       sessionID: session.id,
       action: 'shell',
       resources: ['cat .env # .env.example'],
     });
-    assert.equal(pRealEnv.effect, 'ask', 'cat .env # .env.example must ask');
+    assert.equal(pRealEnv.effect, 'deny', 'cat .env # .env.example must deny immediately');
 
-    // 3. `git push` asks, AND even after replying "always" (saving `git push *` to DB),
+    const pServiceStat = await client.permission.create({
+      sessionID: session.id,
+      action: 'shell',
+      resources: ["stat -c '%y %n' /root/.config/opencode/service.json"],
+    });
+    assert.equal(pServiceStat.effect, 'deny', 'stat on service.json must deny immediately');
+
+    const pReadEnv = await client.permission.create({
+      sessionID: session.id,
+      action: 'read',
+      resources: ['.env'],
+    });
+    assert.equal(pReadEnv.effect, 'deny', 'read .env must deny immediately');
+
+    const pReadExample = await client.permission.create({
+      sessionID: session.id,
+      action: 'read',
+      resources: ['.env.example'],
+    });
+    assert.equal(pReadExample.effect, 'allow', 'read .env.example must stay allowed');
+
+    // 2b. Subagent (`worker`) denies both secret edits (despite `edit * allow`) AND destructive shell ops,
+    //     while still allowing safe `.env.example` commands silently.
+    const workerSession = await client.session.create({ title: 'wave1-worker-e2e', agent: 'worker' });
+    const pWorkerEditEnv = await client.permission.create({
+      sessionID: workerSession.id,
+      agent: 'worker',
+      action: 'edit',
+      resources: ['.env'],
+    });
+    assert.equal(pWorkerEditEnv.effect, 'deny', 'worker edit .env must deny despite edit * allow');
+
+    const pWorkerEditExample = await client.permission.create({
+      sessionID: workerSession.id,
+      agent: 'worker',
+      action: 'edit',
+      resources: ['.env.example'],
+    });
+    assert.equal(pWorkerEditExample.effect, 'allow', 'worker edit .env.example must stay allowed');
+
+    const pWorkerPush = await client.permission.create({
+      sessionID: workerSession.id,
+      agent: 'worker',
+      action: 'shell',
+      resources: ['git push origin main'],
+    });
+    assert.equal(pWorkerPush.effect, 'deny', 'worker git push must deny so background subagents never stall AFK');
+
+    const pWorkerExample = await client.permission.create({
+      sessionID: workerSession.id,
+      agent: 'worker',
+      action: 'shell',
+      resources: ['cat .env.example'],
+    });
+    assert.equal(pWorkerExample.effect, 'allow', 'worker cat .env.example must stay allowed');
+
+    // 3. `git push` asks on primary agent, AND even after replying "always" (saving `git push *` to DB),
     //    our `permission.hook("evaluate")` STILL enforces `ask`!
     const pPush1 = await client.permission.create({
       sessionID: session.id,
+      agent: 'build',
       action: 'shell',
       resources: ['git push origin main'],
       save: ['git push *'],
@@ -945,6 +1079,7 @@ test(
 
     const pPush2 = await client.permission.create({
       sessionID: session.id,
+      agent: 'build',
       action: 'shell',
       resources: ['git push origin main'],
       save: ['git push *'],
@@ -957,8 +1092,8 @@ test(
 // 6. Wave 1 Reviewer Audit Regression Tests (B1, B2, B3, B4 + non-blocking)
 // ============================================================================
 
-test('regression B1: wrapper args, heredoc substitutions, control-flow, eval, pipe-to-shell, curl -dfoo/-sX, git checkout . ALL ask', () => {
-  const mustAskEvenWithStaticFallback = [
+test('regression B1: wrapper args, heredoc substitutions, control-flow, eval, pipe-to-shell, curl -dfoo/-sX, git checkout . deny secrets and gate destructive ops', () => {
+  const mustDenySecrets = [
     'xargs -a .env echo',
     'xargs --arg-file=.env echo',
     'cat <<EOF\n$(cat .env)\nEOF',
@@ -966,6 +1101,10 @@ test('regression B1: wrapper args, heredoc substitutions, control-flow, eval, pi
     'env -S "cat .env"',
     'env --split-string="cat .env"',
     'timeout -s .env 5 ls',
+    'echo ok # .env',
+  ];
+
+  const mustAskPrimaryDenySubagent = [
     '(git push origin main)',
     '{ git push origin main; }',
     'if true; then git push origin main; fi',
@@ -982,17 +1121,28 @@ test('regression B1: wrapper args, heredoc substitutions, control-flow, eval, pi
     'curl -sX POST https://api.example.com',
     'curl -sXDELETE https://api.example.com',
     'git checkout .',
-    'echo ok # .env',
   ];
 
-  for (const cmd of mustAskEvenWithStaticFallback) {
+  for (const cmd of mustDenySecrets) {
     const direct = evaluateShellCommand(cmd);
     if (!cmd.startsWith('echo ok #')) {
-      assert.equal(direct.ask, true, `expected evaluateShellCommand ASK for: ${cmd}`);
+      assert.equal(direct.ask, true, `expected guard hit for: ${cmd}`);
+      assert.equal(direct.deny, true, `expected DENY for secret command: ${cmd}`);
     }
-    const input = { action: 'shell', resources: [cmd], effect: 'ask' };
+    const input = { action: 'shell', agent: 'build', resources: [cmd], effect: 'ask' };
     evaluatePermissionInput(input);
-    assert.equal(input.effect, 'ask', `ask -> allow override MUST NOT cancel ask for: ${cmd}`);
+    assert.equal(input.effect, 'deny', `secret command MUST resolve to deny: ${cmd}`);
+  }
+
+  for (const cmd of mustAskPrimaryDenySubagent) {
+    const direct = evaluateShellCommand(cmd);
+    assert.equal(direct.ask, true, `expected evaluateShellCommand ASK for: ${cmd}`);
+    const primaryInput = { action: 'shell', agent: 'build', resources: [cmd], effect: 'ask' };
+    evaluatePermissionInput(primaryInput);
+    assert.equal(primaryInput.effect, 'ask', `primary agent MUST ask for: ${cmd}`);
+    const subInput = { action: 'shell', agent: 'worker', resources: [cmd], effect: 'ask' };
+    evaluatePermissionInput(subInput);
+    assert.equal(subInput.effect, 'deny', `subagent MUST deny (never stall AFK) for: ${cmd}`);
   }
 });
 

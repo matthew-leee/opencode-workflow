@@ -1532,6 +1532,12 @@ describe("verify-setup", () => {
     assert.ok(result.checks.some((check) => /Bounded context\/media limits/u.test(check)));
     assert.ok(result.checks.some((check) => /\.env protection/u.test(check)));
     assert.equal(config.agents.worker.steps, undefined, "worker spin is bounded dynamically, not by a static step cap");
+    for (const resource of [".env", ".env.local", "id_rsa", "server.pem", "/app/secrets/key", "/root/.config/opencode/service.json", "/root/.config/opencode/auth.json"]) {
+      for (const action of FILE_ACTIONS) {
+        const rule = VERIFY_INTERNALS.lastMatchingRule(config.permissions, action, resource);
+        assert.equal(rule?.effect, "deny", `${action} ${resource} must resolve to deny (never stall AFK)`);
+      }
+    }
   });
 
   test("strict config validation bounds models, steps, read-only roles and context limits", () => {
@@ -1586,7 +1592,7 @@ describe("verify-setup", () => {
 
     for (const action of ENV_PROTECTED_ACTIONS) {
       const broken = structuredClone(compliant);
-      broken.permissions = broken.permissions.filter((rule) => !(rule.action === action && rule.effect === "ask"));
+      broken.permissions = broken.permissions.filter((rule) => !(rule.action === action && (rule.effect === "ask" || rule.effect === "deny")));
       const result = validateConfig(broken);
       assert.equal(result.ok, false, action);
       assert.ok(

@@ -1346,10 +1346,14 @@ export default Plugin.define({
         const sessionID = safeRead(input, 'sessionID');
         const agent = safeRead(input, 'agent');
         touchSession(sessionID, { agent });
+        const meta = typeof sessionID === 'string' ? bus.getSessionMeta(sessionID) : null;
 
         let guard = { overridden: false, originalEffect: safeRead(input, 'effect') ?? null, reason: null, category: null };
         try {
-          guard = evaluatePermissionInput(input);
+          guard = evaluatePermissionInput(input, {
+            agent: meta?.agent ?? null,
+            isChildSession: Boolean(meta?.rootSessionID && meta.rootSessionID !== sessionID),
+          });
         } catch (error) {
           record('plugin.error', { where: 'permission.guard', message: describeError(error) });
         }

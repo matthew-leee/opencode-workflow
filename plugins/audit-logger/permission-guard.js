@@ -5,9 +5,15 @@
  * lexing, segment splitting, subshell/heredoc/wrapper unwrapping, and semantic classification:
  *
  *   - NEVER weakens `effect === "deny"` (read-only agents stay strictly read-only).
- *   - Escalates `allow -> ask` on real `.env`/`.env.local`/`production.env`/private keys
- *     and destructive local or remote/infra/DB mutations (even if a stale saved `"always"`
- *     rule exists in `opencode.db`).
+ *   - Immediately DENIES (`-> "deny"`) real `.env`/`.env.local`/`production.env`, private keys,
+ *     and credential files (`service.json`, `auth.json`, `.netrc`, `secrets/*`, etc.) on BOTH
+ *     shell and single-path file tools (even if a stale saved `"always"` rule exists in
+ *     `opencode.db`), so AFK sessions never stall waiting for a prompt that should not be allowed.
+ *   - Secret hits ALWAYS take precedence over destructive/remote/infra `ask` hits across
+ *     wrappers (`sudo cat .env`, `eval "cat .env"`), compound segments, subshells, and resources.
+ *   - Escalates destructive local or remote/infra/DB mutations to `ask` on primary agents
+ *     (`build`, `plan`) and to `deny` on subagents (`worker`, `escalate-*`, etc.) so background
+ *     subagents never hang AFK waiting for interactive confirmation.
  *   - Overrides the static fail-closed `*.env*` shell fallback `ask -> allow` ONLY when
  *     EVERY `.env` occurrence across the raw command string is accounted for by a parsed
  *     safe template (`.env.example`, `.env.sample`, `.env.template`, ...) or safe code
@@ -21,6 +27,12 @@ export const MAX_PARSE_DEPTH = 6;
 export const MAX_SEGMENTS = 128;
 
 const SHELL_ACTIONS = new Set(['shell', 'bash']);
+const FILE_ACTIONS = new Set(['read', 'edit', 'write', 'patch']);
+const PRIMARY_AGENTS = new Set(['build', 'plan']);
+
+export function isSubagentName(agent) {
+  return typeof agent === 'string' && agent.trim().length > 0 && !PRIMARY_AGENTS.has(agent.trim().toLowerCase());
+}
 
 /** Template suffixes on `.env.*` that are safe documentation templates, not live secrets. */
 const SAFE_ENV_TEMPLATE_SUFFIXES = new Set([
@@ -404,12 +416,31 @@ function countSafeAccountedEnvOccurrences(token, { isFileContext = false, isRedi
   return safeCount === total ? safeCount : -1;
 }
 
+/** Collapse `//`, `/./`, and `segment/../` in a POSIX-style path for secret matching. */
+function normalizePosixPath(inputPath) {
+  const isAbs = inputPath.startsWith('/');
+  const parts = [];
+  for (const part of inputPath.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      if (parts.length > 0 && parts[parts.length - 1] !== '..') {
+        parts.pop();
+      } else if (!isAbs) {
+        parts.push('..');
+      }
+      continue;
+    }
+    parts.push(part);
+  }
+  return (isAbs ? '/' : '') + parts.join('/');
+}
+
 /** Detect references to private keys or credential directories in shell tokens/redirections. */
 function classifyOtherSecretReference(rawToken) {
   if (typeof rawToken !== 'string' || rawToken.length === 0) return null;
   const cleaned = rawToken.replace(/^['"`]+|['"`]+$/g, '').replace(/\\/g, '/');
   if (!cleaned) return null;
-  const lower = cleaned.toLowerCase();
+  const lower = normalizePosixPath(cleaned.toLowerCase());
   const base = lower.includes('/') ? lower.slice(lower.lastIndexOf('/') + 1) : lower;
 
   if (SECRET_FILE_BASENAMES.has(base) || /^id_(?:rsa|ed25519|ecdsa|dsa)(?:\.|$)/.test(base)) {
@@ -427,6 +458,56 @@ function classifyOtherSecretReference(rawToken) {
   }
   if (/(?:^|\/)opencode\/(?:auth|service)\.json$/.test(lower)) {
     return { kind: 'secret', target: cleaned, reason: `accesses OpenCode credential file ${cleaned}` };
+  }
+  return null;
+}
+
+/** Strip one pair of matching outer shell quotes if present. */
+function stripOuterQuotes(raw) {
+  if (typeof raw !== 'string' || raw.length < 2) return raw ?? '';
+  const first = raw[0];
+  const last = raw[raw.length - 1];
+  if ((first === '"' || first === "'" || first === '`') && last === first) {
+    return raw.slice(1, -1);
+  }
+  return raw;
+}
+
+/**
+ * Scan raw tokens (and optional heredocs / nested shell strings) for secret references.
+ * Used before early `destructive`/`remote` returns (`sudo`, `eval`, pipe-to-shell) so a
+ * secret hit ALWAYS wins (`deny`) over a promptable `ask`.
+ */
+function findSecretInSubcommand(tokenList, heredocs = [], depth = 0) {
+  for (const tok of tokenList) {
+    if (typeof tok !== 'string' || !tok) continue;
+    const envHit = classifyEnvReference(tok, { isFileContext: true });
+    if (envHit) return { ask: true, deny: true, category: 'secret', reason: envHit.reason, safeEnvCount: 0 };
+    const secretHit = classifyOtherSecretReference(tok);
+    if (secretHit) return { ask: true, deny: true, category: 'secret', reason: secretHit.reason, safeEnvCount: 0 };
+    const accounted = countSafeAccountedEnvOccurrences(tok, { isFileContext: true });
+    if (accounted < 0) {
+      return { ask: true, deny: true, category: 'secret', reason: `argument references sensitive .env (${tok})`, safeEnvCount: 0 };
+    }
+    const inlineHit = inspectInlineCodeForSecrets(tok);
+    if (inlineHit) return { ask: true, deny: true, category: 'secret', reason: inlineHit.reason, safeEnvCount: 0 };
+    if (depth < MAX_PARSE_DEPTH && /[\s;|&$`<>]/.test(tok)) {
+      const inner = evaluateShellCommand(stripOuterQuotes(tok), depth + 1);
+      if (inner.ask && inner.category === 'secret') {
+        return { ask: true, deny: true, category: 'secret', reason: inner.reason, safeEnvCount: 0 };
+      }
+    }
+  }
+  for (const hd of heredocs) {
+    if (!hd || typeof hd.body !== 'string') continue;
+    if (depth < MAX_PARSE_DEPTH) {
+      const inner = evaluateShellCommand(hd.body, depth + 1);
+      if (inner.ask && inner.category === 'secret') {
+        return { ask: true, deny: true, category: 'secret', reason: inner.reason, safeEnvCount: 0 };
+      }
+    }
+    const inlineHit = inspectInlineCodeForSecrets(hd.body);
+    if (inlineHit) return { ask: true, deny: true, category: 'secret', reason: inlineHit.reason, safeEnvCount: 0 };
   }
   return null;
 }
@@ -1125,6 +1206,7 @@ function evaluateSegment(segment, depth) {
 
   // 5. Unwrap wrappers while preserving and scanning every dropped wrapper flag/argument!
   const droppedWrapperArgs = [];
+  let deferredGuardHit = null;
   let unwrapGuard = 0;
   while (unwrapGuard < 8 && tokens.length > 0) {
     unwrapGuard += 1;
@@ -1138,9 +1220,19 @@ function evaluateSegment(segment, depth) {
     const rest = tokens.slice(1);
 
     if (c === 'sudo' || c === 'su' || c === 'doas') {
+      const secretHit = findSecretInSubcommand([...droppedWrapperArgs, ...rest], segment.heredocs, depth);
+      if (secretHit) return secretHit;
       return { ask: true, category: 'destructive', reason: `privilege escalation (${c}) requires approval`, safeEnvCount: 0 };
     }
     if (c === 'eval') {
+      const secretHit = findSecretInSubcommand([...droppedWrapperArgs, ...rest], segment.heredocs, depth);
+      if (secretHit) return secretHit;
+      if (depth < MAX_PARSE_DEPTH && rest.length > 0) {
+        const evalInner = evaluateShellCommand(rest.map(stripOuterQuotes).join(' '), depth + 1);
+        if (evalInner.ask && evalInner.category === 'secret') {
+          return { ask: true, deny: true, category: 'secret', reason: evalInner.reason, safeEnvCount: 0 };
+        }
+      }
       return { ask: true, category: 'destructive', reason: 'dynamic shell evaluation (eval) requires approval', safeEnvCount: 0 };
     }
 
@@ -1152,16 +1244,24 @@ function evaluateSegment(segment, depth) {
           const splitCmd = tokens[idx + 1];
           if (typeof splitCmd === 'string') {
             const inner = evaluateShellCommand(splitCmd, depth + 1);
-            if (inner.ask) return { ...inner, safeEnvCount: 0 };
+            if (inner.ask) {
+              if (inner.category === 'secret') return { ...inner, safeEnvCount: 0 };
+              if (!deferredGuardHit) deferredGuardHit = { ...inner, safeEnvCount: 0 };
+            }
           } else {
-            return { ask: true, category: 'parse', reason: 'env -S without argument requires approval', parseError: true, safeEnvCount: 0 };
+            if (!deferredGuardHit) {
+              deferredGuardHit = { ask: true, category: 'parse', reason: 'env -S without argument requires approval', parseError: true, safeEnvCount: 0 };
+            }
           }
           idx += 2;
           continue;
         }
         if (t.startsWith('--split-string=')) {
           const inner = evaluateShellCommand(t.slice('--split-string='.length), depth + 1);
-          if (inner.ask) return { ...inner, safeEnvCount: 0 };
+          if (inner.ask) {
+            if (inner.category === 'secret') return { ...inner, safeEnvCount: 0 };
+            if (!deferredGuardHit) deferredGuardHit = { ...inner, safeEnvCount: 0 };
+          }
           idx += 1;
           continue;
         }
@@ -1267,21 +1367,33 @@ function evaluateSegment(segment, depth) {
   }
 
   if (tokens.length === 0) {
-    return { ask: false, safeEnvCount };
+    return deferredGuardHit ?? { ask: false, safeEnvCount };
   }
 
   const cmd = baseCommandName(tokens[0]);
   const args = tokens.slice(1);
 
   if (cmd === 'sudo' || cmd === 'su' || cmd === 'doas') {
+    const secretHit = findSecretInSubcommand(args, segment.heredocs, depth);
+    if (secretHit) return secretHit;
     return { ask: true, category: 'destructive', reason: `privilege escalation (${cmd}) requires approval`, safeEnvCount: 0 };
   }
   if (cmd === 'eval') {
+    const secretHit = findSecretInSubcommand(args, segment.heredocs, depth);
+    if (secretHit) return secretHit;
+    if (depth < MAX_PARSE_DEPTH && args.length > 0) {
+      const evalInner = evaluateShellCommand(args.map(stripOuterQuotes).join(' '), depth + 1);
+      if (evalInner.ask && evalInner.category === 'secret') {
+        return { ask: true, deny: true, category: 'secret', reason: evalInner.reason, safeEnvCount: 0 };
+      }
+    }
     return { ask: true, category: 'destructive', reason: 'dynamic shell evaluation (eval) requires approval', safeEnvCount: 0 };
   }
 
-  // 6. Piping directly into a shell (`echo "..." | bash`, `curl ... | sh`) ALWAYS asks!
+  // 6. Piping directly into a shell (`echo "..." | bash`, `curl ... | sh`) ALWAYS asks (or denies if touching secrets)!
   if (segment.pipedIn && SHELL_LAUNCHERS.has(cmd)) {
+    const secretHit = findSecretInSubcommand(args, segment.heredocs, depth);
+    if (secretHit) return secretHit;
     return { ask: true, category: 'remote', reason: `piping input into shell (${cmd}) requires approval`, safeEnvCount: 0 };
   }
 
@@ -1293,14 +1405,20 @@ function evaluateSegment(segment, depth) {
         const innerCmd = args[i + 1];
         if (typeof innerCmd === 'string') {
           const innerEval = evaluateShellCommand(innerCmd, depth + 1);
-          if (innerEval.ask) return { ...innerEval, safeEnvCount: 0 };
+          if (innerEval.ask) {
+            if (innerEval.category === 'secret') return { ...innerEval, safeEnvCount: 0 };
+            if (!deferredGuardHit) deferredGuardHit = { ...innerEval, safeEnvCount: 0 };
+          }
         }
         break;
       }
     }
     for (const hd of segment.heredocs) {
       const innerEval = evaluateShellCommand(hd.body, depth + 1);
-      if (innerEval.ask) return { ...innerEval, safeEnvCount: 0 };
+      if (innerEval.ask) {
+        if (innerEval.category === 'secret') return { ...innerEval, safeEnvCount: 0 };
+        if (!deferredGuardHit) deferredGuardHit = { ...innerEval, safeEnvCount: 0 };
+      }
     }
   }
 
@@ -1369,6 +1487,9 @@ function evaluateSegment(segment, depth) {
 
   // Defensive check: ensure preUnwrapTokens didn't smuggle any unexamined token
   void preUnwrapTokens;
+
+  // Return any deferred non-secret wrapper/subcommand guard hit now that secret checks passed.
+  if (deferredGuardHit) return deferredGuardHit;
 
   // 9. Destructive local mutations.
   if (cmd === 'rm') {
@@ -1446,37 +1567,117 @@ function evaluateSegment(segment, depth) {
   return { ask: false, safeEnvCount };
 }
 
+/** Best-effort raw secret scan used when shell parsing fails or hits max depth. */
+function findRawSecretToken(command) {
+  if (typeof command !== 'string' || command.length === 0) return null;
+  const pieces = command.slice(0, MAX_COMMAND_CHARS).split(/[\s;|&()<>`]+/).filter(Boolean);
+  for (const piece of pieces) {
+    const envHit = classifyEnvReference(piece, { isFileContext: true });
+    if (envHit) return envHit;
+    const secretHit = classifyOtherSecretReference(piece);
+    if (secretHit) return secretHit;
+  }
+  return null;
+}
+
 /**
  * Evaluate a full shell command string (including compound segments and embedded subshells).
- * Returns `{ ask: boolean, parsed: boolean, allEnvAccounted: boolean, category?, reason? }`.
+ * Returns `{ ask: boolean, deny: boolean, effect: 'allow'|'ask'|'deny', parsed: boolean, allEnvAccounted: boolean, category?, reason? }`.
+ * Note: `ask: true` marks any guarded command; `deny: true` (`effect: 'deny'`) marks secret hits,
+ * which always take precedence over non-secret `ask` hits across all segments and subshells.
  */
 export function evaluateShellCommand(command, depth = 0) {
   if (depth > MAX_PARSE_DEPTH) {
-    return { ask: true, parsed: false, allEnvAccounted: false, category: 'parse', reason: 'shell nesting depth exceeded safe evaluator bound' };
+    const rawSecret = findRawSecretToken(command);
+    if (rawSecret) {
+      return {
+        ask: true,
+        deny: true,
+        effect: 'deny',
+        parsed: false,
+        allEnvAccounted: false,
+        category: 'secret',
+        reason: rawSecret.reason,
+      };
+    }
+    return {
+      ask: true,
+      deny: false,
+      effect: 'ask',
+      parsed: false,
+      allEnvAccounted: false,
+      category: 'parse',
+      reason: 'shell nesting depth exceeded safe evaluator bound',
+    };
   }
   const parsed = parseShellSegments(command);
   if (!parsed.ok) {
-    return { ask: true, parsed: false, allEnvAccounted: false, category: 'parse', reason: `unparseable shell command (${parsed.error})` };
+    const rawSecret = findRawSecretToken(command);
+    if (rawSecret) {
+      return {
+        ask: true,
+        deny: true,
+        effect: 'deny',
+        parsed: false,
+        allEnvAccounted: false,
+        category: 'secret',
+        reason: rawSecret.reason,
+      };
+    }
+    return {
+      ask: true,
+      deny: false,
+      effect: 'ask',
+      parsed: false,
+      allEnvAccounted: false,
+      category: 'parse',
+      reason: `unparseable shell command (${parsed.error})`,
+    };
   }
 
   let totalSafeEnv = 0;
+  let firstNonSecret = null;
+
   for (const segment of parsed.segments) {
     const verdict = evaluateSegment(segment, depth);
     if (verdict.ask) {
-      return {
-        ask: true,
-        parsed: !verdict.parseError,
-        allEnvAccounted: false,
-        category: verdict.category,
-        reason: verdict.reason,
-      };
+      if (verdict.category === 'secret') {
+        return {
+          ask: true,
+          deny: true,
+          effect: 'deny',
+          parsed: !verdict.parseError,
+          allEnvAccounted: false,
+          category: 'secret',
+          reason: verdict.reason,
+        };
+      }
+      if (!firstNonSecret) {
+        firstNonSecret = {
+          ask: true,
+          deny: false,
+          effect: 'ask',
+          parsed: !verdict.parseError,
+          allEnvAccounted: false,
+          category: verdict.category,
+          reason: verdict.reason,
+        };
+      }
+    } else {
+      totalSafeEnv += verdict.safeEnvCount ?? 0;
     }
-    totalSafeEnv += verdict.safeEnvCount ?? 0;
   }
 
   for (const sub of parsed.subshells) {
     const subVerdict = evaluateShellCommand(sub, depth + 1);
-    if (subVerdict.ask) return subVerdict;
+    if (subVerdict.ask) {
+      if (subVerdict.category === 'secret') return subVerdict;
+      if (!firstNonSecret) firstNonSecret = subVerdict;
+    }
+  }
+
+  if (firstNonSecret) {
+    return firstNonSecret;
   }
 
   // Strict accounting for `ask -> allow` override:
@@ -1487,7 +1688,7 @@ export function evaluateShellCommand(command, depth = 0) {
     rawEnvCount === 0 ||
     (!parsed.hasComments && parsed.subshells.length === 0 && totalSafeEnv === rawEnvCount);
 
-  return { ask: false, parsed: true, allEnvAccounted };
+  return { ask: false, deny: false, effect: 'allow', parsed: true, allEnvAccounted };
 }
 
 /**
@@ -1495,20 +1696,25 @@ export function evaluateShellCommand(command, depth = 0) {
  * Mutates `input.effect` (and `input.message` when escalating) in place, and returns
  * a structured audit summary `{ originalEffect, finalEffect, overridden, category, reason }`.
  */
-export function evaluatePermissionInput(input) {
+export function evaluatePermissionInput(input, context = null) {
   if (!input || typeof input !== 'object') {
     return { overridden: false, originalEffect: null, finalEffect: null, reason: null };
   }
   const originalEffect = input.effect ?? null;
   const action = typeof input.action === 'string' ? input.action.toLowerCase() : '';
+  const resolvedAgent =
+    typeof input.agent === 'string' && input.agent.trim().length > 0
+      ? input.agent.trim()
+      : typeof context?.agent === 'string' && context.agent.trim().length > 0
+        ? context.agent.trim()
+        : null;
+  // An explicit primary agent (`build`, `plan`) stays primary even after session rotation
+  // (where `rootSessionID !== sessionID`); only fall back to `isChildSession` when agent is absent.
+  const isSubagent = resolvedAgent ? isSubagentName(resolvedAgent) : context?.isChildSession === true;
 
   // CRITICAL: Never weaken an explicit `deny` (e.g. read-only agents).
   if (originalEffect === 'deny') {
     return { overridden: false, originalEffect, finalEffect: 'deny', reason: null };
-  }
-
-  if (!SHELL_ACTIONS.has(action)) {
-    return { overridden: false, originalEffect, finalEffect: originalEffect, reason: null };
   }
 
   const resources = Array.isArray(input.resources)
@@ -1521,9 +1727,42 @@ export function evaluatePermissionInput(input) {
     return { overridden: false, originalEffect, finalEffect: originalEffect, reason: null };
   }
 
+  // Defense in depth for single-path file tools (`read`, `edit`, `write`, `patch`):
+  // deny secret files immediately even if a broad agent rule (like worker's `edit * allow`)
+  // or stale saved rule in `opencode.db` resolved to `allow`/`ask`. Safe templates like
+  // `.env.example` return null from `classifyEnvReference` and remain unaffected.
+  if (FILE_ACTIONS.has(action)) {
+    for (const resource of resources) {
+      const hit =
+        classifyEnvReference(resource, { isFileContext: true }) ??
+        classifyOtherSecretReference(resource);
+      if (hit) {
+        input.effect = 'deny';
+        if (!input.message) {
+          input.message = `Permission guard: ${hit.reason} (secret access is denied; use safe templates like .env.example or ask the user in your response)`;
+        }
+        return {
+          overridden: originalEffect !== 'deny',
+          originalEffect,
+          finalEffect: 'deny',
+          category: 'secret',
+          reason: hit.reason,
+        };
+      }
+    }
+    return { overridden: false, originalEffect, finalEffect: originalEffect, reason: null };
+  }
+
+  if (!SHELL_ACTIONS.has(action)) {
+    return { overridden: false, originalEffect, finalEffect: originalEffect, reason: null };
+  }
+
+  const subagent = isSubagent;
+  const subagentLabel = resolvedAgent ?? 'subagent';
   let allParsedCleanly = true;
   let allEnvAccounted = true;
   let anyHasEnv = false;
+  let firstNonSecret = null;
 
   for (const resource of resources) {
     if (resource.toLowerCase().includes('.env')) anyHasEnv = true;
@@ -1531,19 +1770,51 @@ export function evaluatePermissionInput(input) {
     if (!verdict.parsed) allParsedCleanly = false;
     if (!verdict.allEnvAccounted) allEnvAccounted = false;
     if (verdict.ask) {
-      const overridden = originalEffect !== 'ask';
-      input.effect = 'ask';
+      if (verdict.category === 'secret') {
+        const overridden = originalEffect !== 'deny';
+        input.effect = 'deny';
+        if (!input.message) {
+          input.message = `Permission guard: ${verdict.reason} (secret access is denied; use safe templates like .env.example or ask the user in your response)`;
+        }
+        return {
+          overridden,
+          originalEffect,
+          finalEffect: 'deny',
+          category: 'secret',
+          reason: verdict.reason ?? null,
+        };
+      }
+      if (!firstNonSecret) firstNonSecret = verdict;
+    }
+  }
+
+  if (firstNonSecret) {
+    if (subagent) {
+      const overridden = originalEffect !== 'deny';
+      input.effect = 'deny';
       if (!input.message) {
-        input.message = `Permission guard: ${verdict.reason}`;
+        input.message = `Permission guard: ${firstNonSecret.reason} (denied for subagent "${subagentLabel}" so background runs never stall; report this to the primary agent)`;
       }
       return {
         overridden,
         originalEffect,
-        finalEffect: 'ask',
-        category: verdict.category ?? null,
-        reason: verdict.reason ?? null,
+        finalEffect: 'deny',
+        category: firstNonSecret.category ?? null,
+        reason: firstNonSecret.reason ?? null,
       };
     }
+    const overridden = originalEffect !== 'ask';
+    input.effect = 'ask';
+    if (!input.message) {
+      input.message = `Permission guard: ${firstNonSecret.reason}`;
+    }
+    return {
+      overridden,
+      originalEffect,
+      finalEffect: 'ask',
+      category: firstNonSecret.category ?? null,
+      reason: firstNonSecret.reason ?? null,
+    };
   }
 
   // Override static fail-closed `*.env*` `ask -> allow` ONLY when:
@@ -1560,6 +1831,35 @@ export function evaluatePermissionInput(input) {
       finalEffect: 'allow',
       category: 'env_safe_override',
       reason: 'every .env reference parsed as safe template or code identifier with no mutating command',
+    };
+  }
+
+  // Unaccounted `.env` substring (e.g. `echo ok # .env` or `.env` inside a subshell/comment):
+  // deny immediately rather than stalling AFK sessions on an ambiguous secret reference.
+  if (originalEffect === 'ask' && !input.message && anyHasEnv && !allEnvAccounted) {
+    input.effect = 'deny';
+    input.message = 'Permission guard: unaccounted .env reference in shell command (secret access is denied; remove the .env reference or use .env.example)';
+    return {
+      overridden: true,
+      originalEffect,
+      finalEffect: 'deny',
+      category: 'secret',
+      reason: 'unaccounted .env reference in shell command',
+    };
+  }
+
+  // Any remaining static `ask` on a subagent shell call is denied so background workers never hang AFK.
+  if (originalEffect === 'ask' && subagent) {
+    input.effect = 'deny';
+    if (!input.message) {
+      input.message = `Permission guard: interactive approval denied for subagent "${subagentLabel}" so background runs never stall; report this to the primary agent`;
+    }
+    return {
+      overridden: true,
+      originalEffect,
+      finalEffect: 'deny',
+      category: 'subagent_ask_denied',
+      reason: 'interactive approval denied for subagent',
     };
   }
 
