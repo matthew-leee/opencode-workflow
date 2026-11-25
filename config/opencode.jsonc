@@ -94,12 +94,12 @@
       ]
     },
 
-    // Bounded implementation: cheap, fast, allowed to edit and run tests.
+    // Bounded implementation: cheap, fast, allowed to edit and run tests. Spin is bounded
+    // dynamically by reactive-guard.js, not a static step cap.
     "worker": {
       "mode": "subagent",
       "model": "openrouter/deepseek/deepseek-v4.1-flash-1017",
       "description": "Bounded implementer for clearly specified, routine edits/tests/docs. Reports what changed and what it verified; never commits.",
-      "steps": 60,
       "permissions": [
         { "action": "edit", "resource": "*", "effect": "allow" },
         { "action": "subagent", "resource": "*", "effect": "deny" },
@@ -137,11 +137,11 @@
       ]
     },
 
-    // Mid-level escalation: stuck debugging, high blast radius.
+    // Mid-level escalation: objective failure only (see Rule #4).
     "escalate-opus": {
       "mode": "subagent",
       "model": "openrouter/anthropic/claude-opus-5.5",
-      "description": "Escalation for repeated failures or high-blast-radius changes (data, auth, migrations, release). May edit; reports reasoning and risk.",
+      "description": "Escalation ONLY on objective failure (2 reviewer rejections with unresolved blockers, same failure twice after 2 distinct attempts, guard-detected spin, or explicit user request). May edit; reports reasoning and risk.",
       "steps": 60,
       "permissions": [
         { "action": "edit", "resource": "*", "effect": "allow" }

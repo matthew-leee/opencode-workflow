@@ -68,6 +68,7 @@ import {
   ENV_SAMPLE_BYPASS_COMMANDS,
   FILE_ACTIONS,
   MAX_SUBAGENT_STEPS,
+  OPTIONAL_STEPS_SUBAGENTS,
   READ_ONLY_AGENTS,
   SHELL_ACTIONS,
   VERIFY_INTERNALS,
@@ -1530,6 +1531,7 @@ describe("verify-setup", () => {
     assert.ok(result.checks.some((check) => /Read-only agents/u.test(check)));
     assert.ok(result.checks.some((check) => /Bounded context\/media limits/u.test(check)));
     assert.ok(result.checks.some((check) => /\.env protection/u.test(check)));
+    assert.equal(config.agents.worker.steps, undefined, "worker spin is bounded dynamically, not by a static step cap");
   });
 
   test("strict config validation bounds models, steps, read-only roles and context limits", () => {
@@ -1541,8 +1543,11 @@ describe("verify-setup", () => {
       ["unpinned worker model", (config) => { delete config.agents.worker.model; }, /has no pinned model id/u],
       ["non-catalog model id", (config) => { config.agents.reviewer.model = "claude-sonnet-5.5"; }, /not a pinned provider\/model id/u],
       ["zero subagent steps", (config) => { config.agents.reviewer.steps = 0; }, /Agent reviewer steps must be a finite number >= 1/u],
-      ["missing subagent steps", (config) => { delete config.agents.worker.steps; }, /Agent worker steps is missing/u],
-      ["unbounded subagent steps", (config) => { config.agents.worker.steps = MAX_SUBAGENT_STEPS + 1; }, /Agent worker steps exceeds the bounded maximum/u],
+      ["missing required subagent steps", (config) => { delete config.agents.reviewer.steps; }, /Agent reviewer steps is missing/u],
+      ["zero worker steps when explicit", (config) => { config.agents.worker.steps = 0; }, /Agent worker steps must be a finite number >= 1/u],
+      ["null worker steps when explicit", (config) => { config.agents.worker.steps = null; }, /Agent worker steps is missing/u],
+      ["unbounded worker steps when explicit", (config) => { config.agents.worker.steps = MAX_SUBAGENT_STEPS + 1; }, /Agent worker steps exceeds the bounded maximum/u],
+      ["unbounded escalate-opus steps", (config) => { config.agents["escalate-opus"].steps = MAX_SUBAGENT_STEPS + 1; }, /Agent escalate-opus steps exceeds the bounded maximum/u],
       ["primary agent demoted", (config) => { config.agents.build.mode = "subagent"; }, /Agent build must be mode "primary"/u],
       ["writable reviewer", (config) => { config.agents.reviewer.permissions = config.agents.reviewer.permissions.filter((rule) => rule.action !== "write"); }, /Agent reviewer is read-only but write .* resolves to (allow|no rule)/u],
       ["writable planner", (config) => { config.agents.plan.permissions = undefined; }, /Agent plan is read-only but declares no permissions/u],
@@ -1563,6 +1568,13 @@ describe("verify-setup", () => {
       assert.equal(result.ok, false, label);
       assert.ok(result.errors.some((error) => pattern.test(error)), `${label}: ${result.errors.join("; ")}`);
     }
+
+    // Omitting `worker.steps` is the intended shape: reactive-guard.js bounds spin dynamically.
+    const omitted = structuredClone(compliant);
+    delete omitted.agents.worker.steps;
+    const omittedResult = validateConfig(omitted);
+    assert.equal(omittedResult.ok, true, omittedResult.errors.join("; "));
+    assert.deepEqual(OPTIONAL_STEPS_SUBAGENTS, ["worker"]);
 
     assert.deepEqual(READ_ONLY_AGENTS, ["reviewer", "fact-checker", "alt-reviewer", "plan"]);
     assert.deepEqual(WRITE_ACTIONS, ["edit", "write", "patch"]);

@@ -33,6 +33,12 @@ export const MAX_AUDIT_EVIDENCE_BYTES = 32 * 1024 * 1024;
 // --- OCW-02/03/04 strict bounds -------------------------------------------------------------
 /** A subagent that can loop longer than this is effectively unbounded *and* unbudgeted. */
 export const MAX_SUBAGENT_STEPS = 100;
+/**
+ * Subagents whose `steps` may be omitted: `reactive-guard.js` bounds spin dynamically (detects
+ * repeated failures and stalls at runtime), so a static step cap is not the control for `worker`.
+ * If `steps` is present anyway, it is still validated against MAX_SUBAGENT_STEPS.
+ */
+export const OPTIONAL_STEPS_SUBAGENTS = Object.freeze(["worker"]);
 /** Compaction must keep a bounded tail, or context cost grows without limit. */
 export const MAX_COMPACTION_KEEP_TOKENS = 200_000;
 export const MAX_TOOL_OUTPUT_LINES = 4_000;
@@ -309,9 +315,18 @@ export function validateConfig(config) {
     const agent = agents[name];
     if (!agent || typeof agent !== "object") continue;
     if (agent.mode !== "subagent") errors.push(`Agent ${name} must be mode "subagent" (found ${JSON.stringify(agent.mode)})`);
-    assertBounded(errors, `Agent ${name} steps`, agent.steps, { max: MAX_SUBAGENT_STEPS });
+    if (OPTIONAL_STEPS_SUBAGENTS.includes(name) && agent.steps === undefined) {
+      // Omitted steps are valid only for the dynamically guarded agents; an explicit value is
+      // still bounded below.
+    } else {
+      assertBounded(errors, `Agent ${name} steps`, agent.steps, { max: MAX_SUBAGENT_STEPS });
+    }
   }
-  if (errors.length === modeErrorsBefore) checks.push(`Agent modes and step limits: pass (subagent steps <= ${MAX_SUBAGENT_STEPS})`);
+  if (errors.length === modeErrorsBefore) {
+    checks.push(
+      `Agent modes and step limits: pass (subagent steps <= ${MAX_SUBAGENT_STEPS}; optional on ${OPTIONAL_STEPS_SUBAGENTS.join(", ")}: reactive-guard bounds spin)`,
+    );
+  }
 
   const readOnlyErrorsBefore = errors.length;
   for (const name of READ_ONLY_AGENTS) {
