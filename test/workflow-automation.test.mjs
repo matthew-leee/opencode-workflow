@@ -2408,8 +2408,8 @@ describe("audit JSONL (Wave 2B) -> analysis (Wave 2C) integration", () => {
     ], "blocked shell actions count as shell friction, not just failed bash tool calls");
     assert.deepEqual(
       report.models.map((model) => [model.model, model.turns, model.costUSD]),
-      [["openrouter/google/gemini-4-neon", 1, 0.1]],
-      "compaction.ended model object is normalized to provider/model",
+      [["openrouter/google/gemini-4-neon", 2, 0.15]],
+      "compaction.ended model object is normalized to provider/model and enriches subsequent session.usage.updated records",
     );
     const recent = new Map(report.recentSessions.map((session) => [session.session, session]));
     assert.equal(recent.get("ses_a1").costUSD, 0.25, "session.usage.updated cost");

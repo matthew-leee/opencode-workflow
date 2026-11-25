@@ -20,6 +20,7 @@ import { basename, dirname, join, parse, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createOpenRouterClientFromEnv, redactSecrets } from "./openrouter-client.mjs";
+import { readOpenCodeDbMetrics } from "./opencode-db.mjs";
 import {
   isAttributedSession,
   isToolStartType,
@@ -37,8 +38,11 @@ export const MIN_TOTAL_SESSIONS = 5;
 export const DEFAULT_SYNTHESIS_MODEL = "deepseek/deepseek-v4.1-flash-1017";
 const TERRA_PATTERN = /gpt-6\.1-terra[\w.-]*/gi;
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-/** Project labels that mean "could not be attributed", never real projects. */
-const UNIDENTIFIED_PROJECTS = new Set(["", "unknown", "unattributed", "undefined", "null"]);
+/**
+ * Project labels that mean "could not be attributed" or ephemeral ad-hoc chats,
+ * never real projects for the cross-project catastrophic-forgetting guard.
+ */
+const UNIDENTIFIED_PROJECTS = new Set(["", "unknown", "unattributed", "undefined", "null", "openchamber-chat"]);
 /** Permission action names that mean "a shell command". */
 const SHELL_ACTIONS = new Set(["bash", "shell", "execute"]);
 
@@ -65,7 +69,7 @@ function entryProject(entry) {
 }
 
 function entryModel(entry) {
-  const value = entry?.model ?? entry?.modelID ?? entry?.modelId ?? entry?.data?.model ?? entry?.data?.modelID ?? entry?.data?.modelId;
+  const value = entry?.model ?? entry?.__model ?? entry?.modelID ?? entry?.modelId ?? entry?.data?.model ?? entry?.data?.modelID ?? entry?.data?.modelId;
   if (typeof value === "string" && value) return value;
   // Compaction events forward the model as an object ({ providerID, modelID }) or as an id.
   if (value && typeof value === "object") {
@@ -269,18 +273,21 @@ export function discoverKnownSkills({ dirs = [] } = {}) {
   return [...names].sort();
 }
 
-function analyzeEntries(entries) {
+function analyzeEntries(entries, { dbMetrics = null } = {}) {
   const projects = new Map();
   const sessions = new Map();
   const models = new Map();
   const tools = new Map();
   const skills = new Map();
   const permissions = new Map();
+  const permissionAsks = new Map();
+  const seenPermissionAskIds = new Set();
   const shellFailures = new Map();
   const skillEvidence = { observations: 0, projects: new Set(), sessions: new Set() };
   let toolCalls = 0;
   let toolErrors = 0;
   let permissionBlocks = 0;
+  let permissionAskCount = 0;
   let skillObservations = 0;
 
   // `tool.before` + `tool.after` describe one call; only the terminal record counts.
@@ -291,16 +298,29 @@ function analyzeEntries(entries) {
     if (callId) completedCalls.add(callId);
   }
 
+  const parentMap = dbMetrics?.sessionParentMap;
+  const rootSessionOf = (sid) => {
+    if (!parentMap || !sid) return sid;
+    let cur = sid;
+    const seen = new Set();
+    while (parentMap.has(cur) && !seen.has(cur)) {
+      seen.add(cur);
+      cur = parentMap.get(cur);
+    }
+    return cur;
+  };
+
   for (const entry of entries) {
     const type = entryType(entry);
     const project = entryProject(entry);
     const session = entrySession(entry);
+    const guardSession = isAttributedSession(session) ? rootSessionOf(session) : session;
     const error = entryError(entry, type);
 
     let projectStat = projects.get(project);
-    if (!projectStat) projectStat = { project, sessions: new Set(), entries: 0, toolCalls: 0, errors: 0 };
+    if (!projectStat) projectStat = { project, sessions: new Set(), entries: 0, toolCalls: 0, errors: 0, costUSD: 0 };
     projectStat.entries += 1;
-    if (isAttributedSession(session)) projectStat.sessions.add(session);
+    if (isAttributedSession(guardSession)) projectStat.sessions.add(guardSession);
     projects.set(project, projectStat);
 
     const sessionKey = `${project}\u0000${session}`;
@@ -337,8 +357,8 @@ function analyzeEntries(entries) {
       if (error) modelStat.errors += 1;
       // Same rule as `recordEvidence()`: a project only counts when this very record also carries an
       // attributed session, so a session-less record cannot inflate a model's project evidence.
-      if (isAttributedSession(session)) {
-        modelStat.sessions.add(sessionKeyOf(project, session));
+      if (isAttributedSession(guardSession)) {
+        modelStat.sessions.add(sessionKeyOf(project, guardSession));
         if (isIdentifiedProject(project)) modelStat.projects.add(project);
       }
       models.set(model, modelStat);
@@ -348,8 +368,8 @@ function analyzeEntries(entries) {
     if (/skill/.test(type)) {
       skillObservations += 1;
       skillEvidence.observations += 1;
-      if (isAttributedSession(session)) {
-        skillEvidence.sessions.add(sessionKeyOf(project, session));
+      if (isAttributedSession(guardSession)) {
+        skillEvidence.sessions.add(sessionKeyOf(project, guardSession));
         if (isIdentifiedProject(project)) skillEvidence.projects.add(project);
       }
     }
@@ -361,8 +381,19 @@ function analyzeEntries(entries) {
     if (blocked) {
       permissionBlocks += 1;
       const resources = entryResources(entry);
-      if (resources.length === 0) recordEvidence(permissions, "unspecified", { project, session, field: "blocks" });
-      for (const resource of resources) recordEvidence(permissions, resource, { project, session, field: "blocks" });
+      if (resources.length === 0) recordEvidence(permissions, "unspecified", { project, session: guardSession, field: "blocks" });
+      for (const resource of resources) recordEvidence(permissions, resource, { project, session: guardSession, field: "blocks" });
+    }
+
+    if (type === "permission.asked") {
+      const permId = String(entry?.permissionID ?? entry?.id ?? entry?.data?.id ?? "");
+      if (!permId || !seenPermissionAskIds.has(permId)) {
+        if (permId) seenPermissionAskIds.add(permId);
+        permissionAskCount += 1;
+        const resources = entryResources(entry);
+        const target = resources[0] ? String(resources[0]).trim().split(/\s+/u).slice(0, 3).join(" ") : (actionName || "unspecified");
+        recordEvidence(permissionAsks, target, { project, session: guardSession, field: "asks" });
+      }
     }
 
     const shellish = tool === "bash" || tool === "shell" || /shell/.test(type) ||
@@ -370,12 +401,107 @@ function analyzeEntries(entries) {
     if (shellish && (error || blocked)) {
       const command = entryResources(entry)[0] || entry?.input?.command || entry?.data?.input?.command || "shell";
       const prefix = String(command).trim().split(/\s+/u).slice(0, 3).join(" ") || "shell";
-      recordEvidence(shellFailures, prefix, { project, session, field: "failures" });
+      recordEvidence(shellFailures, prefix, { project, session: guardSession, field: "failures" });
     }
   }
 
+  // Merge authoritative session/project/model/cost stats from read-only `opencode.db`.
+  // Guard integrity (B4):
+  //   - Child subagent sessions (`parentId != null`) contribute their spend (we verified
+  //     empirically that parent `session_v2.cost` excludes children) and model turns,
+  //     but do NOT inflate independent session counts in `projectStat.sessions` or the
+  //     catastrophic-forgetting guard!
+  //   - Zero-activity DB-only sessions (no cost and no tokens) do not count as evidence.
+  //   - Ephemeral `openchamber-chat` sessions are in `UNIDENTIFIED_PROJECTS` so ad-hoc
+  //     chats never supply a second project to unlock global pruning.
+  if (dbMetrics?.available) {
+    for (const dbSession of dbMetrics.sessions ?? []) {
+      const project = dbSession.project || "unknown";
+      let projectStat = projects.get(project);
+      if (!projectStat) projectStat = { project, sessions: new Set(), entries: 0, toolCalls: 0, errors: 0, costUSD: 0 };
+      const totalTokens =
+        (dbSession.tokens?.input ?? 0) +
+        (dbSession.tokens?.output ?? 0) +
+        (dbSession.tokens?.reasoning ?? 0) +
+        (dbSession.tokens?.cacheRead ?? 0) +
+        (dbSession.tokens?.cacheWrite ?? 0);
+      const hasActivity = dbSession.costUSD > 0 || totalTokens > 0;
+      const isRootSession = !dbSession.parentId;
+      if (isRootSession && hasActivity) {
+        projectStat.sessions.add(dbSession.id);
+      }
+      projectStat.costUSD += dbSession.costUSD;
+      projects.set(project, projectStat);
+
+      const sessionKey = `${project}\u0000${dbSession.id}`;
+      let sessionStat = sessions.get(sessionKey);
+      if (!sessionStat) {
+        sessionStat = {
+          project,
+          session: dbSession.id,
+          parentId: dbSession.parentId ?? null,
+          entries: 0,
+          toolCalls: 0,
+          errors: 0,
+          cost: dbSession.costUSD,
+          models: new Set(dbSession.model ? [dbSession.model] : []),
+          last: dbSession.timeUpdated ?? dbSession.timeCreated ?? null,
+        };
+        sessions.set(sessionKey, sessionStat);
+      } else {
+        if (Number.isFinite(dbSession.costUSD) && dbSession.costUSD > sessionStat.cost) {
+          sessionStat.cost = dbSession.costUSD;
+        }
+        if (dbSession.model) sessionStat.models.add(dbSession.model);
+        if (dbSession.timeUpdated && (!sessionStat.last || dbSession.timeUpdated > sessionStat.last)) {
+          sessionStat.last = dbSession.timeUpdated;
+        }
+      }
+    }
+
+    // Authoritative per-model turn/cost/error metrics come from `session_message` in opencode.db
+    // when available (audit logs omit model on sparse usage events). Strip `#variant` when
+    // checking overlap so `provider/model#xhigh` in audit logs does not duplicate `provider/model`
+    // already counted authoritatively from `opencode.db`.
+    if (Array.isArray(dbMetrics.models) && dbMetrics.models.length > 0) {
+      const stripVariant = (id) => String(id ?? "").replace(/#[^#]*$/u, "");
+      const mergedModels = new Map();
+      const dbBaseKeys = new Set();
+      for (const m of dbMetrics.models) {
+        const base = stripVariant(m.model);
+        dbBaseKeys.add(base);
+        mergedModels.set(m.model, {
+          model: m.model,
+          turns: m.turns,
+          costUSD: m.costUSD,
+          errors: m.errors,
+          projects: new Set(m._projects ?? []),
+          sessions: new Set(m._sessions ?? []),
+        });
+      }
+      for (const [modelName, auditStat] of models.entries()) {
+        if (!mergedModels.has(modelName) && !dbBaseKeys.has(stripVariant(modelName))) {
+          mergedModels.set(modelName, auditStat);
+        }
+      }
+      models.clear();
+      for (const [k, v] of mergedModels.entries()) models.set(k, v);
+    }
+  } else {
+    // Derive project cost from session sums when DB is not used.
+    for (const s of sessions.values()) {
+      const proj = projects.get(s.project);
+      if (proj) proj.costUSD += s.cost;
+    }
+  }
+
+  const totalCostUSD = dbMetrics?.available
+    ? dbMetrics.totalCostUSD
+    : Number([...sessions.values()].reduce((sum, s) => sum + s.cost, 0).toFixed(4));
+
   return {
     entries: entries.length,
+    totalCostUSD,
     projects: [...projects.values()]
       .map((stat) => ({
         project: stat.project,
@@ -383,9 +509,10 @@ function analyzeEntries(entries) {
         entries: stat.entries,
         toolCalls: stat.toolCalls,
         errors: stat.errors,
+        costUSD: Number(stat.costUSD.toFixed(4)),
         errorRate: stat.toolCalls ? stat.errors / stat.toolCalls : 0,
       }))
-      .sort((a, b) => b.entries - a.entries || a.project.localeCompare(b.project)),
+      .sort((a, b) => b.costUSD - a.costUSD || b.entries - a.entries || a.project.localeCompare(b.project)),
     sessionCount: [...sessions.values()].filter((stat) => isAttributedSession(stat.session)).length,
     toolCalls,
     toolErrors,
@@ -402,13 +529,17 @@ function analyzeEntries(entries) {
         errorRate: stat.turns ? stat.errors / stat.turns : 0,
         evidence: evidenceOf(stat),
       }))
-      .sort((a, b) => b.turns - a.turns || a.model.localeCompare(b.model)),
+      .sort((a, b) => b.costUSD - a.costUSD || b.turns - a.turns || a.model.localeCompare(b.model)),
     skillsUsed: sortedCounts(skills).map(({ key, count }) => ({ skill: key, activations: count })),
     skillEvidence: { observations: skillEvidence.observations, ...evidenceOf(skillEvidence) },
     permissionBlocks,
     permissionResources: [...permissions.entries()]
       .sort((a, b) => b[1].blocks - a[1].blocks || a[0].localeCompare(b[0]))
       .map(([resource, stat]) => ({ resource, blocks: stat.blocks, evidence: evidenceOf(stat) })),
+    permissionAskCount,
+    permissionAskResources: [...permissionAsks.entries()]
+      .sort((a, b) => b[1].asks - a[1].asks || a[0].localeCompare(b[0]))
+      .map(([resource, stat]) => ({ resource, asks: stat.asks, evidence: evidenceOf(stat) })),
     shellFailures: [...shellFailures.entries()]
       .sort((a, b) => b[1].failures - a[1].failures || a[0].localeCompare(b[0]))
       .map(([command, stat]) => ({ command, failures: stat.failures, evidence: evidenceOf(stat) })),
@@ -588,8 +719,25 @@ export async function runRsiPrune(options = {}) {
   const days = Number.isFinite(Number(options.days)) && Number(options.days) > 0 ? Number(options.days) : DEFAULT_RSI_DAYS;
   const now = options.now ?? Date.now();
   const auditDirs = options.auditDirs ?? (options.auditDir ? [options.auditDir] : []);
-  const scan = readAuditEntries({ dirs: auditDirs, days, now, maxEvents: options.maxEvents ?? null });
-  const analysis = analyzeEntries(scan.entries);
+  // Auto-read authoritative opencode.db metrics unless explicitly disabled or running against
+  // explicit isolated auditDirs without an explicit dbPath.
+  const effectiveDbPath = options.dbPath !== undefined
+    ? options.dbPath
+    : (auditDirs.length > 0 ? false : undefined);
+  const dbMetrics = await readOpenCodeDbMetrics({
+    dbPath: effectiveDbPath,
+    days,
+    now,
+  });
+  const scan = readAuditEntries({
+    dirs: auditDirs,
+    days,
+    now,
+    maxEvents: options.maxEvents ?? null,
+    sessionDirectoryMap: dbMetrics.available ? dbMetrics.sessionDirectoryMap : null,
+    sessionModelMap: dbMetrics.available ? dbMetrics.sessionModelMap : null,
+  });
+  const analysis = analyzeEntries(scan.entries, { dbMetrics });
 
   const identifiedProjects = analysis.projects.filter((project) => isIdentifiedProject(project.project));
   const unidentifiedProjects = analysis.projects.filter((project) => !isIdentifiedProject(project.project));
@@ -635,7 +783,17 @@ export async function runRsiPrune(options = {}) {
     days,
     auditFiles: scan.files,
     auditEntries: scan.entries.length,
+    deduplicatedEvents: scan.deduplicatedEvents ?? 0,
     skippedAuditLines: scan.skippedLines,
+    totalCostUSD: analysis.totalCostUSD,
+    sources: {
+      auditEntries: scan.entries.length,
+      deduplicatedEvents: scan.deduplicatedEvents ?? 0,
+      dbAvailable: dbMetrics.available,
+      dbPath: dbMetrics.available ? dbMetrics.dbPath : null,
+      dbSessions: dbMetrics.available ? dbMetrics.sessionCount : 0,
+      dbError: dbMetrics.error ?? null,
+    },
     guard: {
       allowed,
       forced,
@@ -673,6 +831,8 @@ export async function runRsiPrune(options = {}) {
     permissions: {
       blocks: analysis.permissionBlocks,
       byResource: analysis.permissionResources,
+      asks: analysis.permissionAskCount,
+      askByResource: analysis.permissionAskResources,
     },
     shell: { failures: analysis.shellFailures },
     terra,
@@ -728,8 +888,11 @@ export async function runRsiPrune(options = {}) {
 export function formatRsiReport(report) {
   const lines = [];
   lines.push(`RSI review — last ${report.days} day(s), generated ${report.generatedAt}`);
-  lines.push(`Audit: ${report.auditEntries} entries from ${report.auditFiles.length} file(s), ${report.skippedAuditLines} malformed line(s) skipped.`);
-  lines.push(`Projects: ${report.projects.map((project) => `${project.project} (${project.sessions} sessions, ${project.toolCalls} tool calls, ${project.errors} errors)`).join("; ") || "none"}`);
+  lines.push(`Audit: ${report.auditEntries} entries from ${report.auditFiles.length} file(s), ${report.deduplicatedEvents ?? 0} duplicate event(s) collapsed, ${report.skippedAuditLines} malformed line(s) skipped.`);
+  if (report.sources?.dbAvailable) {
+    lines.push(`OpenCode DB (read-only): ${report.sources.dbSessions} session(s), $${Number(report.totalCostUSD ?? 0).toFixed(4)} total spend (${report.sources.dbPath}).`);
+  }
+  lines.push(`Projects: ${report.projects.map((project) => `${project.project} (${project.sessions} sessions, ${project.toolCalls} tool calls, ${project.errors} errors${project.costUSD ? `, $${project.costUSD}` : ""})`).join("; ") || "none"}`);
   lines.push(`Guard: ${report.guard.allowed ? "ALLOWED" : "REFUSED"} — ${report.guard.reason}`);
   lines.push(`Tools: ${report.toolStats.calls} calls, ${report.toolStats.errors} errors (${(report.toolStats.errorRate * 100).toFixed(1)}%).`);
   if (report.toolStats.byTool.length) lines.push(`Tool mix: ${report.toolStats.byTool.map((item) => `${item.tool}=${item.calls}`).join(", ")}`);
@@ -746,6 +909,9 @@ export function formatRsiReport(report) {
     }
   }
   lines.push(`Permission blocks: ${report.permissions.blocks}${report.permissions.byResource.length ? ` (${report.permissions.byResource.map((item) => `${item.resource}=${item.blocks}`).join(", ")})` : ""}`);
+  if ((report.permissions.asks ?? 0) > 0) {
+    lines.push(`Permission asks: ${report.permissions.asks}${report.permissions.askByResource?.length ? ` (${report.permissions.askByResource.slice(0, 8).map((item) => `${item.resource}=${item.asks}`).join(", ")})` : ""}`);
+  }
   if (report.shell.failures.length) lines.push(`Shell friction: ${report.shell.failures.map((item) => `${item.command}=${item.failures}`).join(", ")}`);
   lines.push(`Terra ban: ${report.terra.ok ? "PASS" : `FAIL (${report.terra.violations.map((item) => `${item.source}:${item.match}`).join(", ")})`}`);
   if (report.warnings.length) {
@@ -787,6 +953,8 @@ function parseCliArgs(argv) {
     };
     if (arg === "--days") options.days = Number(next());
     else if (arg === "--audit-dir") options.auditDirs.push(next());
+    else if (arg === "--db") options.dbPath = next();
+    else if (arg === "--no-db") options.dbPath = false;
     else if (arg === "--force") options.force = true;
     else if (arg === "--with-llm") options.withLlm = true;
     else if (arg === "--model") options.model = next();

@@ -1,24 +1,26 @@
 /**
- * opencode-workflow audit logger — OpenCode v2.3.2 (`@opencode/plugin@2.3.2`).
+ * opencode-workflow core plugin — OpenCode v2 (`@opencode/plugin@2.3.2`).
  *
- * Writes one append-only JSONL record per interesting OpenCode action to
- * `$OPENCODE_WORKFLOW_AUDIT_DIR` (default `~/.local/share/opencode-workflow/audit`),
- * one file per UTC day. Records are redacted with ./redact.js before serialization.
+ * Wave 1 Core Plugin Foundation:
+ *   1. Deduplicated, secret-redacted append-only JSONL audit logger with process-wide
+ *      single event subscription + `eventID` LRU dedupe + `location`/`model` enrichment.
+ *   2. Structured JS shell & secret permission evaluator (`permission.hook("evaluate")`).
+ *   3. Per-root-session Main <-> Subagent Shared Blackboard (`/tmp/opencode/blackboard/<rootSessionID>/`,
+ *      0700/0600): auto-materializes inline user attachments, tracks sibling reports / file
+ *      ownership / failed attempts, injects a compact pointer into subagent spawns, and
+ *      validates empty/malformed child returns with real `git status --short` evidence.
  *
  * Design constraints, in order of priority:
- *
  *   1. The plugin must never break OpenCode. Every hook, event handler and write is
- *      wrapped: failures disable logging, they do not propagate.
- *   2. No secret reaches disk. Tool inputs, shell commands, permission resources and
- *      event payloads pass through deep redaction; `shell.create.before` never touches
- *      the `env` values at all.
- *   3. Log volume is bounded. Strings are capped, the tool-timing map is bounded, and a
- *      single pathological record is replaced by a truncation marker.
+ *      wrapped: failures never propagate out of setup/hooks/cleanup.
+ *   2. No secret reaches disk. Tool inputs, shell commands, permission resources,
+ *      blackboard reports, and event payloads pass through deep redaction;
+ *      `shell.create.before` never touches `env` values at all.
+ *   3. Log volume and in-memory tables are strictly bounded.
  *
  * Host resolution: `Host.resolve` loads a local directory that has a `package.json`
  * without an `exports` map through its conventional entrypoint, so this file is the
- * plugin entrypoint (`main: index.js`). An `exports` map here would make OpenCode try
- * to resolve the directory as an installed package by name instead.
+ * plugin entrypoint (`main: index.js`).
  */
 
 import fs from 'node:fs';
@@ -27,9 +29,57 @@ import path from 'node:path';
 
 import { Plugin } from '@opencode/plugin';
 
+import {
+  BLACKBOARD_DIR_ENV,
+  BLACKBOARD_MARKER,
+  collectWorkspaceFallbackState,
+  createBlackboardManager,
+  extractBackgroundSubagentResults,
+  extractSubagentResultInfo,
+  isSensitiveAttachmentName,
+  resolveBlackboardRoot,
+  validateSubagentOutput,
+} from './blackboard.js';
+import {
+  classifyEnvReference,
+  evaluatePermissionInput,
+  evaluateShellCommand,
+  parseShellSegments,
+} from './permission-guard.js';
 import { REDACTED, redact, redactString } from './redact.js';
+import {
+  BoundedMetaMap,
+  BoundedSeenSet,
+  MAX_SEEN_EVENT_IDS,
+  formatModelRef,
+  getSharedBus,
+  resetSharedBusForTests,
+} from './shared-bus.js';
 
-export { REDACTED, redact, redactString };
+export {
+  BLACKBOARD_DIR_ENV,
+  BLACKBOARD_MARKER,
+  BoundedMetaMap,
+  BoundedSeenSet,
+  MAX_SEEN_EVENT_IDS,
+  REDACTED,
+  classifyEnvReference,
+  collectWorkspaceFallbackState,
+  createBlackboardManager,
+  evaluatePermissionInput,
+  evaluateShellCommand,
+  extractBackgroundSubagentResults,
+  extractSubagentResultInfo,
+  formatModelRef,
+  getSharedBus,
+  isSensitiveAttachmentName,
+  parseShellSegments,
+  redact,
+  redactString,
+  resetSharedBusForTests,
+  resolveBlackboardRoot,
+  validateSubagentOutput,
+};
 
 export const PLUGIN_ID = 'opencode-workflow-audit';
 export const AUDIT_DIR_ENV = 'OPENCODE_WORKFLOW_AUDIT_DIR';
@@ -50,9 +100,10 @@ const RESULT_PREVIEW_CHARS = 500;
 const COMPACTION_PREVIEW_CHARS = 200;
 const ERROR_MESSAGE_CHARS = 1000;
 const MAX_LISTED_ITEMS = 50;
+const FILE_MUTATION_TOOLS = new Set(['edit', 'write', 'patch', 'apply_patch']);
 
 /**
- * Event types consumed by the background subscriber. Kept as an explicit list so the
+ * Event types consumed by the shared background subscriber. Kept as an explicit list so the
  * subscription is bounded and stable: OpenCode only forwards what is asked for.
  */
 export const EVENT_TYPES = [
@@ -184,13 +235,6 @@ function octal(mode) {
  * Failure is fail-closed on purpose. If the directory cannot be verified as 0700, or the
  * day file cannot be opened as a regular file and verified as 0600, the writer disables
  * itself instead of appending secrets to a world-readable file (or trusting a symlink).
- *
- * Each record is serialized to one buffer and written with synchronous `writeSync` on an
- * O_APPEND descriptor. `writeAll` loops until every byte is written. On a local regular
- * file a single write appends the whole line atomically, so two OpenCode processes
- * normally do not interleave lines; there is no cross-process lock, so a short write
- * completed by a second append could in principle interleave with another writer. Sync is
- * deliberate: a hook may run right before process exit, and a buffered write would be lost.
  */
 export function createAuditLog(options = {}) {
   const directory = options.directory ? path.resolve(options.directory) : resolveAuditDir();
@@ -228,15 +272,11 @@ export function createAuditLog(options = {}) {
       return false;
     }
     try {
-      // A symlinked audit directory could point at a shared location, so refuse it before
-      // any chmod would silently operate on the link target.
       const before = io.lstatSync(directory);
       if (before.isSymbolicLink() || !before.isDirectory()) {
         disable(new Error(`audit directory is not a real directory: ${directory}`));
         return false;
       }
-      // Tighten a pre-existing directory too: 0700 is the audit contract, and a
-      // world-readable parent would expose yesterday's records.
       try {
         io.chmodSync(directory, AUDIT_DIR_MODE);
       } catch (error) {
@@ -259,8 +299,6 @@ export function createAuditLog(options = {}) {
     }
   }
 
-  // `prepareDirectory()` disables the writer itself if the directory is unsafe or the mode
-  // cannot be enforced; the writer then stays inert and openFor() is never reached.
   prepareDirectory();
 
   function closeFd() {
@@ -280,8 +318,6 @@ export function createAuditLog(options = {}) {
 
     const file = path.join(directory, `${day}.jsonl`);
 
-    // Refuse symlinks and non-regular files before opening. This is a friendly early
-    // refusal; the O_NOFOLLOW / O_NONBLOCK open plus fstat check below close the race.
     try {
       const existing = io.lstatSync(file);
       if (existing.isSymbolicLink() || !existing.isFile()) {
@@ -291,9 +327,6 @@ export function createAuditLog(options = {}) {
       if (error?.code !== 'ENOENT') throw error;
     }
 
-    // O_NOFOLLOW refuses a symlink swapped in after the lstat; O_NONBLOCK makes opening a
-    // FIFO fail (ENXIO) instead of hanging until a reader appears. Neither changes regular
-    // file writes.
     const constants = io.constants ?? fs.constants;
     const flags =
       constants.O_CREAT |
@@ -308,8 +341,6 @@ export function createAuditLog(options = {}) {
       if (!stats.isFile()) {
         throw new Error(`refusing to write audit log: ${file} is not a regular file`);
       }
-      // fchmod on the open descriptor, then verify it took effect. If it did not, fail
-      // closed rather than append secrets into a world-readable file.
       try {
         io.fchmodSync(candidate, AUDIT_FILE_MODE);
       } catch (error) {
@@ -356,8 +387,6 @@ export function createAuditLog(options = {}) {
         const record = { ts, v: 1, event, ...data };
         line = JSON.stringify(record);
       } catch (error) {
-        // A payload that cannot be serialized (BigInt left unredacted, toJSON that
-        // throws) costs one detail field, not the whole audit trail.
         line = JSON.stringify({
           ts,
           v: 1,
@@ -366,7 +395,6 @@ export function createAuditLog(options = {}) {
         });
       }
       if (line.length > MAX_LINE_CHARS) {
-        // A single pathological record must not bloat the log; keep the marker only.
         line = JSON.stringify({
           ts,
           v: 1,
@@ -423,7 +451,6 @@ function summarizeStructuredError(error, depth = 0) {
     if (safeInstanceOf(error, Error)) {
       const rawName = safeRead(error, 'name');
       const summary = {
-        // Error.name is attacker-controlled too (SDKs and providers embed keys in it).
         name: redactString(typeof rawName === 'string' && rawName.length > 0 ? rawName : 'Error', {
           maxLength: ERROR_MESSAGE_CHARS,
         }),
@@ -439,7 +466,6 @@ function summarizeStructuredError(error, depth = 0) {
       if (cause && cause !== error) summary.cause = summarizeStructuredError(cause, depth + 1);
       return summary;
     }
-    // Structured (schema) errors are plain objects: keep the useful fields only.
     const summary = {};
     const name = safeRead(error, 'name') ?? safeRead(error, '_tag');
     if (typeof name !== 'undefined') {
@@ -537,6 +563,78 @@ export function summarizeToolResult(result) {
   }
 }
 
+function extractEditedFilePaths(toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return [];
+  const paths = [];
+  for (const key of ['path', 'filePath', 'file']) {
+    const val = safeRead(toolInput, key);
+    if (typeof val === 'string' && val.trim().length > 0) paths.push(val.trim());
+  }
+  return paths;
+}
+
+/**
+ * Extract the final assistant text from `ctx.session.context({ sessionID })` messages.
+ * Distinguishes a tool-call-only turn (`hasToolCalls: true, text: ''`) from a genuinely
+ * empty final assistant response so `experimental.idle` does not emit spurious "empty" reports.
+ */
+function inspectLatestAssistantMessage(messages) {
+  if (!Array.isArray(messages)) return { found: false, text: '', hasToolCalls: false };
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    const role = safeRead(msg, 'role') ?? safeRead(msg, 'type');
+    if (role !== 'assistant') continue;
+    const text = safeRead(msg, 'text');
+    if (typeof text === 'string' && text.trim().length > 0) {
+      return { found: true, text, hasToolCalls: false };
+    }
+    const content = safeRead(msg, 'content');
+    if (typeof content === 'string') {
+      return { found: true, text: content, hasToolCalls: false };
+    }
+    if (Array.isArray(content)) {
+      let hasToolCalls = false;
+      const parts = [];
+      for (const part of content) {
+        if (typeof part === 'string') {
+          parts.push(part);
+          continue;
+        }
+        const partType = safeRead(part, 'type');
+        if (partType === 'tool' || partType === 'tool-call' || partType === 'tool_use') {
+          hasToolCalls = true;
+          continue;
+        }
+        if (partType === 'text' || partType === undefined) {
+          const t = safeRead(part, 'text');
+          if (typeof t === 'string') parts.push(t);
+        }
+      }
+      return { found: true, text: parts.filter(Boolean).join('\n'), hasToolCalls };
+    }
+    return { found: true, text: '', hasToolCalls: false };
+  }
+  return { found: false, text: '', hasToolCalls: false };
+}
+
+function appendFallbackToToolResult(result, notice) {
+  if (!result || typeof result !== 'object' || typeof notice !== 'string' || !notice) return;
+  try {
+    if (typeof result.output === 'string') {
+      result.output = result.output.trim().length > 0 ? `${result.output}\n\n${notice}` : notice;
+    } else if (result.output && typeof result.output === 'object' && typeof result.output.output === 'string') {
+      result.output.output = result.output.output.trim().length > 0 ? `${result.output.output}\n\n${notice}` : notice;
+    }
+    if (Array.isArray(result.content)) {
+      result.content.push({ type: 'text', text: notice });
+    } else if (typeof result.content === 'string') {
+      result.content = result.content.trim().length > 0 ? `${result.content}\n\n${notice}` : notice;
+    }
+  } catch {
+    // Non-extensible/frozen result object: diagnostic is still saved in the Blackboard.
+  }
+}
+
 // --- plugin -----------------------------------------------------------------------
 
 export default Plugin.define({
@@ -547,8 +645,6 @@ export default Plugin.define({
     try {
       log = createAuditLog();
     } catch (error) {
-      // createAuditLog already swallows filesystem failures; this guards the invariant
-      // that nothing here can reject the plugin's setup.
       log = {
         record: () => false,
         close: () => {},
@@ -557,14 +653,25 @@ export default Plugin.define({
         disabledReason: describeError(error),
       };
     }
+
+    const locationDir = safeRead(ctx?.location, 'directory') ?? null;
+    const locationWorkspaceID = safeRead(ctx?.location, 'workspaceID') ?? null;
+    const instanceLocation = locationDir
+      ? {
+          directory: optionalRedact(locationDir),
+          workspaceID: optionalRedact(locationWorkspaceID),
+        }
+      : null;
+
+    const bus = getSharedBus(log.directory);
+    const blackboard = createBlackboardManager();
     const calls = new BoundedCallMap(MAX_PENDING_CALLS);
+    const processedBgResults = new BoundedSeenSet(2_000);
     /** @type {Array<{ dispose: () => Promise<void> | void }>} */
     const registrations = [];
-    const controller = new AbortController();
     let cleaned = false;
     let cleanupPromise = null;
 
-    // Best-effort record helper: logging must never escape a hook.
     const record = (event, data = {}) => {
       try {
         log.record(event, data);
@@ -572,6 +679,57 @@ export default Plugin.define({
         // createAuditLog().record already swallows; this is belt and braces.
       }
     };
+
+    function resolveLocationForSession(sessionID, explicitLocation = null) {
+      if (explicitLocation && typeof explicitLocation === 'object' && safeRead(explicitLocation, 'directory')) {
+        return optionalRedact(explicitLocation);
+      }
+      const meta = typeof sessionID === 'string' ? bus.getSessionMeta(sessionID) : null;
+      if (meta?.directory) {
+        return {
+          directory: optionalRedact(meta.directory),
+          workspaceID: optionalRedact(meta.workspaceID),
+        };
+      }
+      if (instanceLocation) return instanceLocation;
+      return optionalRedact(explicitLocation);
+    }
+
+    function resolveModelForSession(sessionID, explicitModel = undefined) {
+      const formatted = formatModelRef(explicitModel);
+      if (formatted) return optionalRedact(formatted);
+      const meta = typeof sessionID === 'string' ? bus.getSessionMeta(sessionID) : null;
+      return meta?.model ? optionalRedact(meta.model) : null;
+    }
+
+    function touchSession(sessionID, patch = {}) {
+      if (typeof sessionID !== 'string' || sessionID.length === 0) return null;
+      return bus.updateSessionMeta(sessionID, {
+        directory: locationDir,
+        workspaceID: locationWorkspaceID,
+        ...patch,
+      });
+    }
+
+    async function resolveRootFor(sessionID) {
+      if (typeof sessionID !== 'string' || sessionID.length === 0) return null;
+      let meta = bus.getSessionMeta(sessionID);
+      if (!meta?.parentSessionID && !meta?.rootSessionID && typeof ctx?.session?.get === 'function') {
+        try {
+          const info = await ctx.session.get({ sessionID });
+          const parentID = safeRead(info, 'parentID') ?? safeRead(info, 'parent_id');
+          if (typeof parentID === 'string' && parentID.length > 0) {
+            bus.linkChildSession(sessionID, parentID, {
+              directory: safeRead(info, 'directory') ?? locationDir,
+              agent: safeRead(info, 'agent'),
+            });
+          }
+        } catch {
+          // Best-effort lookup only.
+        }
+      }
+      return bus.resolveRootSessionID(sessionID) ?? sessionID;
+    }
 
     record('plugin.loaded', {
       plugin: PLUGIN_ID,
@@ -581,8 +739,8 @@ export default Plugin.define({
         channel: optionalRedact(safeRead(ctx?.app, 'channel')),
       },
       location: {
-        directory: optionalRedact(safeRead(ctx?.location, 'directory')),
-        workspaceID: optionalRedact(safeRead(ctx?.location, 'workspaceID')),
+        directory: optionalRedact(locationDir),
+        workspaceID: optionalRedact(locationWorkspaceID),
       },
       auditDir: log.directory,
       loggingEnabled: log.enabled,
@@ -590,7 +748,6 @@ export default Plugin.define({
       pid: process.pid,
       node: process.version,
       platform: process.platform,
-      // Option values may be credentials; only names are safe to record.
       optionKeys: (() => {
         try {
           return Object.keys(ctx?.options ?? {});
@@ -616,18 +773,40 @@ export default Plugin.define({
       }
     }
 
-    // (b) session.prompt — a redacted preview, not the prompt body.
+    // (a) session.prompt — auto-materialize inline attachments + record redacted preview.
     await addHook('session', 'prompt', async (input) => {
       try {
+        const sessionID = safeRead(input, 'sessionID');
+        const messageID = safeRead(input, 'messageID');
         const prompt = safeRead(input, 'prompt') ?? {};
         const text = safeRead(prompt, 'text');
         const files = safeRead(prompt, 'files');
         const agents = safeRead(prompt, 'agents');
         const skills = safeRead(prompt, 'skills');
-        record('session.prompt', {
-          sessionID: optionalRedact(safeRead(input, 'sessionID')),
-          messageID: optionalRedact(safeRead(input, 'messageID')),
+
+        touchSession(sessionID);
+
+        let materialized = [];
+        if (typeof sessionID === 'string' && Array.isArray(files) && files.length > 0) {
+          try {
+            const rootSessionID = (await resolveRootFor(sessionID)) ?? sessionID;
+            materialized = blackboard.materializeAttachments({
+              rootSessionID,
+              messageID: typeof messageID === 'string' ? messageID : null,
+              files,
+              directory: locationDir,
+            });
+          } catch (error) {
+            record('plugin.error', { where: 'blackboard.materialize', message: describeError(error) });
+          }
+        }
+
+        const payload = {
+          sessionID: optionalRedact(sessionID),
+          messageID: optionalRedact(messageID),
           delivery: optionalRedact(safeRead(input, 'delivery')),
+          location: resolveLocationForSession(sessionID),
+          model: resolveModelForSession(sessionID),
           prompt: {
             chars: typeof text === 'string' ? text.length : 0,
             preview:
@@ -652,24 +831,175 @@ export default Plugin.define({
             ? skills.slice(0, MAX_LISTED_ITEMS).map((skill) => optionalRedact(safeRead(skill, 'id')))
             : optionalRedact(skills),
           metadata: optionalRedact(safeRead(input, 'metadata')),
-        });
+        };
+        if (materialized.length > 0) {
+          payload.blackboardAttachments = materialized.map((item) => ({
+            name: optionalRedact(item.name),
+            mime: optionalRedact(item.mime),
+            bytes: item.bytes,
+            path: optionalRedact(item.path),
+          }));
+        }
+        record('session.prompt', payload);
       } catch (error) {
         record('plugin.error', { where: 'session.prompt', message: describeError(error) });
       }
     });
 
-    // (c) tool.execute.before / .after, with start times bounded by BoundedCallMap.
+    // (b) session.context — capture authoritative model/agent, refresh Blackboard pointer for
+    //     child sessions, and validate async `<background-result kind="subagent">` returns.
+    await addHook('session', 'context', async (input) => {
+      try {
+        const sessionID = safeRead(input, 'sessionID');
+        const agent = safeRead(input, 'agent');
+        const model = safeRead(input, 'model');
+        touchSession(sessionID, { agent, model });
+
+        if (typeof sessionID !== 'string' || sessionID.length === 0) return;
+
+        const rootSessionID = (await resolveRootFor(sessionID)) ?? sessionID;
+        const meta = bus.getSessionMeta(sessionID);
+        const isChildSession = Boolean(meta?.parentSessionID && meta.parentSessionID !== sessionID);
+
+        // Refresh Blackboard pointer in child system prompt so resumed/long-running children
+        // see newly materialized attachments and sibling reports.
+        if (isChildSession && blackboard.exists(rootSessionID)) {
+          try {
+            const system = safeRead(input, 'system');
+            if (Array.isArray(system)) {
+              blackboard.injectIntoSystemParts(system, rootSessionID);
+            }
+          } catch (error) {
+            record('plugin.error', { where: 'blackboard.context_inject', message: describeError(error) });
+          }
+        }
+
+        // Capture & validate `<background-result kind="subagent">` notices delivered to parent.
+        const messages = safeRead(input, 'messages');
+        if (Array.isArray(messages) && messages.length > 0) {
+          const bgResults = extractBackgroundSubagentResults(messages);
+          for (const bg of bgResults) {
+            const bgKey = `${bg.sessionID}:${bg.state}:${bg.body.length}:${bg.body.slice(0, 64)}`;
+            const isFirstSight = processedBgResults.addIfNew(bgKey);
+            try {
+              const childMeta = bus.getSessionMeta(bg.sessionID);
+              const recorded = isFirstSight
+                ? blackboard.recordSubagentReport({
+                    rootSessionID,
+                    sessionID: bg.sessionID,
+                    agent: childMeta?.agent || bg.agent || 'subagent',
+                    description: bg.description,
+                    text: bg.body,
+                    status: bg.state || 'completed',
+                    directory: locationDir,
+                  })
+                : (() => {
+                    const existing = blackboard.readManifest(rootSessionID)?.reports?.find(
+                      (r) => r.sessionID === bg.sessionID && !r.valid,
+                    );
+                    if (!existing) return null;
+                    return {
+                      validation: { valid: false, issue: existing.issue },
+                      fallbackNotice: [
+                        `[Blackboard validation warning: child ${existing.agent} (${existing.sessionID}) returned ${existing.issue}]`,
+                        `Exit/state: ${bg.state || 'completed'}`,
+                        existing.gitStatus ? `Workspace git status --short:\n${existing.gitStatus}` : '',
+                        existing.path ? `Diagnostic report saved: ${existing.path}` : '',
+                      ].filter(Boolean).join('\n'),
+                    };
+                  })();
+              if (recorded && !recorded.validation.valid && recorded.fallbackNotice) {
+                const system = safeRead(input, 'system');
+                if (Array.isArray(system)) {
+                  const diagMarker = `<!-- OCW-SUBAGENT-DIAG:${bg.sessionID} -->`;
+                  const existsDiag = system.some(
+                    (part) => typeof part?.text === 'string' && part.text.includes(diagMarker),
+                  );
+                  if (!existsDiag) {
+                    system.push({ text: `${diagMarker}\n${recorded.fallbackNotice}` });
+                  }
+                }
+              }
+            } catch (error) {
+              record('plugin.error', { where: 'blackboard.background_result', message: describeError(error) });
+            }
+          }
+        }
+      } catch (error) {
+        record('plugin.error', { where: 'session.context', message: describeError(error) });
+      }
+    });
+
+    // (c) session.experimental.idle — capture completed child subagent output into Blackboard.
+    await addHook('session', 'experimental.idle', async (input) => {
+      try {
+        const sessionID = safeRead(input, 'sessionID');
+        const background = safeRead(input, 'background');
+        if (typeof sessionID !== 'string' || sessionID.length === 0) return;
+        if (Array.isArray(background) && background.length > 0) return;
+
+        const rootSessionID = (await resolveRootFor(sessionID)) ?? sessionID;
+        const meta = bus.getSessionMeta(sessionID);
+        const isChildSession = Boolean(meta?.parentSessionID && meta.parentSessionID !== sessionID);
+        if (!isChildSession || !blackboard.exists(rootSessionID)) return;
+
+        if (typeof ctx?.session?.context === 'function') {
+          try {
+            const messages = await ctx.session.context({ sessionID });
+            const latest = inspectLatestAssistantMessage(messages);
+            // Skip tool-call-only turns (not a genuinely empty final response).
+            if (!latest.found || (latest.hasToolCalls && latest.text.trim().length === 0)) return;
+            blackboard.recordSubagentReport({
+              rootSessionID,
+              sessionID,
+              agent: meta?.agent || 'subagent',
+              description: blackboard.readManifest(rootSessionID)?.sessions?.[sessionID]?.description || '',
+              text: latest.text,
+              status: 'completed',
+              directory: meta?.directory || locationDir,
+            });
+          } catch (error) {
+            record('plugin.error', { where: 'blackboard.child_idle', message: describeError(error) });
+          }
+        }
+      } catch (error) {
+        record('plugin.error', { where: 'session.experimental.idle', message: describeError(error) });
+      }
+    });
+
+    // (d) tool.execute.before — inject compact Blackboard pointer into `subagent` spawns + timing.
     await addHook('tool', 'execute.before', async (input) => {
       try {
         const callId = safeRead(input, 'id');
+        const toolName = safeRead(input, 'tool');
+        const sessionID = safeRead(input, 'sessionID');
+        const agent = safeRead(input, 'agent');
         const key = String(callId);
-        calls.set(key, { startedAt: Date.now(), tool: safeRead(input, 'tool') });
+
+        touchSession(sessionID, { agent });
+        calls.set(key, { startedAt: Date.now(), tool: toolName });
+
+        if (toolName === 'subagent' && typeof sessionID === 'string' && sessionID.length > 0) {
+          try {
+            const rootSessionID = (await resolveRootFor(sessionID)) ?? sessionID;
+            blackboard.ensureBoard(rootSessionID, locationDir);
+            const toolInput = safeRead(input, 'input');
+            if (toolInput && typeof toolInput === 'object' && typeof safeRead(toolInput, 'prompt') === 'string') {
+              toolInput.prompt = blackboard.injectIntoPrompt(toolInput.prompt, rootSessionID);
+            }
+          } catch (error) {
+            record('plugin.error', { where: 'blackboard.subagent_before', message: describeError(error) });
+          }
+        }
+
         record('tool.before', {
-          tool: optionalRedact(safeRead(input, 'tool')),
+          tool: optionalRedact(toolName),
           callId: optionalRedact(callId),
-          sessionID: optionalRedact(safeRead(input, 'sessionID')),
-          agent: optionalRedact(safeRead(input, 'agent')),
+          sessionID: optionalRedact(sessionID),
+          agent: optionalRedact(agent),
           messageID: optionalRedact(safeRead(input, 'messageID')),
+          location: resolveLocationForSession(sessionID),
+          model: resolveModelForSession(sessionID),
           input: optionalRedact(safeRead(input, 'input')),
         });
       } catch (error) {
@@ -677,18 +1007,130 @@ export default Plugin.define({
       }
     });
 
+    // (e) tool.execute.after — track subagent lineage, validate child returns, track file ownership.
     await addHook('tool', 'execute.after', async (input) => {
       try {
         const callId = safeRead(input, 'id');
+        const toolName = safeRead(input, 'tool');
+        const sessionID = safeRead(input, 'sessionID');
+        const agent = safeRead(input, 'agent');
+        const status = safeRead(input, 'status');
         const key = String(callId);
         const timing = calls.take(key);
-        const status = safeRead(input, 'status');
+
+        touchSession(sessionID, { agent });
+
+        if (typeof sessionID === 'string' && sessionID.length > 0) {
+          const rootSessionID = (await resolveRootFor(sessionID)) ?? sessionID;
+
+          if (toolName === 'subagent') {
+            try {
+              const toolInput = safeRead(input, 'input');
+              const childAgent = safeRead(toolInput, 'agent') || 'subagent';
+              const childDesc = safeRead(toolInput, 'description') || '';
+
+              if (status === 'error') {
+                const errSummary = describeError(safeRead(input, 'error'));
+                const recorded = blackboard.recordSubagentReport({
+                  rootSessionID,
+                  sessionID: String(callId || 'subagent_err'),
+                  agent: childAgent,
+                  description: childDesc,
+                  text: '',
+                  status: 'error',
+                  directory: locationDir,
+                  error: errSummary,
+                });
+                if (recorded?.fallbackNotice) {
+                  record('blackboard.subagent_invalid', {
+                    rootSessionID: optionalRedact(rootSessionID),
+                    sessionID: optionalRedact(sessionID),
+                    agent: optionalRedact(childAgent),
+                    issue: 'error',
+                    reportPath: optionalRedact(recorded.report?.path),
+                  });
+                }
+              } else {
+                const resultObj = safeRead(input, 'result');
+                const info = extractSubagentResultInfo(resultObj);
+                if (info.childSessionID) {
+                  bus.linkChildSession(info.childSessionID, sessionID, {
+                    directory: locationDir,
+                    workspaceID: locationWorkspaceID,
+                    agent: childAgent,
+                  });
+                  blackboard.recordSubagentSpawn({
+                    rootSessionID,
+                    childSessionID: info.childSessionID,
+                    agent: childAgent,
+                    description: childDesc,
+                    directory: locationDir,
+                  });
+                }
+                if (!info.isBackgroundRunning) {
+                  const recorded = blackboard.recordSubagentReport({
+                    rootSessionID,
+                    sessionID: info.childSessionID || String(callId || 'subagent'),
+                    agent: childAgent,
+                    description: childDesc,
+                    text: info.text,
+                    status: info.status || String(status || 'completed'),
+                    directory: locationDir,
+                  });
+                  if (recorded && !recorded.validation.valid && recorded.fallbackNotice) {
+                    appendFallbackToToolResult(resultObj, recorded.fallbackNotice);
+                    record('blackboard.subagent_invalid', {
+                      rootSessionID: optionalRedact(rootSessionID),
+                      sessionID: optionalRedact(info.childSessionID || sessionID),
+                      agent: optionalRedact(childAgent),
+                      issue: recorded.validation.issue,
+                      reportPath: optionalRedact(recorded.report?.path),
+                    });
+                  }
+                }
+              }
+            } catch (error) {
+              record('plugin.error', { where: 'blackboard.subagent_after', message: describeError(error) });
+            }
+          } else if (status === 'completed' && FILE_MUTATION_TOOLS.has(String(toolName || '').toLowerCase())) {
+            try {
+              const filePaths = extractEditedFilePaths(safeRead(input, 'input'));
+              if (filePaths.length > 0) {
+                blackboard.recordFileOwnership({
+                  rootSessionID,
+                  sessionID,
+                  agent: agent || 'unknown',
+                  filePaths,
+                  directory: locationDir,
+                });
+              }
+            } catch (error) {
+              record('plugin.error', { where: 'blackboard.file_ownership', message: describeError(error) });
+            }
+          } else if (status === 'error') {
+            try {
+              blackboard.recordFailedAttempt({
+                rootSessionID,
+                sessionID,
+                agent: agent || 'unknown',
+                tool: toolName || 'tool',
+                summary: describeError(safeRead(input, 'error')),
+                directory: locationDir,
+              });
+            } catch (error) {
+              record('plugin.error', { where: 'blackboard.failed_attempt', message: describeError(error) });
+            }
+          }
+        }
+
         const data = {
-          tool: optionalRedact(safeRead(input, 'tool')),
+          tool: optionalRedact(toolName),
           callId: optionalRedact(callId),
-          sessionID: optionalRedact(safeRead(input, 'sessionID')),
-          agent: optionalRedact(safeRead(input, 'agent')),
+          sessionID: optionalRedact(sessionID),
+          agent: optionalRedact(agent),
           messageID: optionalRedact(safeRead(input, 'messageID')),
+          location: resolveLocationForSession(sessionID),
+          model: resolveModelForSession(sessionID),
           status: optionalRedact(status),
           durationMs: timing ? Math.max(0, Date.now() - timing.startedAt) : null,
           timing: timing ? 'measured' : 'unknown',
@@ -705,31 +1147,51 @@ export default Plugin.define({
       }
     });
 
-    // (d) permission.evaluate — the evaluated decision and its resources.
+    // (f) permission.evaluate — structured JS shell/secret evaluator + audit record.
     await addHook('permission', 'evaluate', async (input) => {
       try {
+        const sessionID = safeRead(input, 'sessionID');
+        const agent = safeRead(input, 'agent');
+        touchSession(sessionID, { agent });
+
+        let guard = { overridden: false, originalEffect: safeRead(input, 'effect') ?? null, reason: null, category: null };
+        try {
+          guard = evaluatePermissionInput(input);
+        } catch (error) {
+          record('plugin.error', { where: 'permission.guard', message: describeError(error) });
+        }
+
         const resources = safeRead(input, 'resources');
-        record('permission.evaluate', {
-          sessionID: optionalRedact(safeRead(input, 'sessionID')),
-          agent: optionalRedact(safeRead(input, 'agent')),
+        const payload = {
+          sessionID: optionalRedact(sessionID),
+          agent: optionalRedact(agent),
+          location: resolveLocationForSession(sessionID),
+          model: resolveModelForSession(sessionID),
           action: optionalRedact(safeRead(input, 'action')),
           resources: Array.isArray(resources)
             ? resources.slice(0, 100).map((resource) => optionalRedact(resource))
             : optionalRedact(resources),
           effect: optionalRedact(safeRead(input, 'effect')),
+          originalEffect: optionalRedact(guard.originalEffect),
           source: optionalRedact(safeRead(input, 'source')),
           message: (() => {
             const message = safeRead(input, 'message');
             if (message === null || typeof message === 'undefined') return null;
             return redactString(String(message), { maxLength: ERROR_MESSAGE_CHARS });
           })(),
-        });
+        };
+        if (guard.overridden) {
+          payload.guardOverridden = true;
+          payload.guardCategory = guard.category ?? null;
+          payload.guardReason = guard.reason ? redactString(guard.reason, { maxLength: 300 }) : null;
+        }
+        record('permission.evaluate', payload);
       } catch (error) {
         record('plugin.error', { where: 'permission.evaluate', message: describeError(error) });
       }
     });
 
-    // (e) shell.create.before — command/cwd/timeout/shell only. NEVER env values.
+    // (g) shell.create.before — command/cwd/timeout/shell only. NEVER env values.
     await addHook('shell', 'create.before', async (input) => {
       try {
         const command = safeRead(input, 'command');
@@ -749,7 +1211,6 @@ export default Plugin.define({
           cwd: optionalRedact(safeRead(input, 'cwd')),
           timeout: typeof timeout === 'number' && Number.isFinite(timeout) ? timeout : null,
           shell: optionalRedact(safeRead(input, 'shell')),
-          // Count only: env values are never read, logged or serialized.
           envVarCount,
         });
       } catch (error) {
@@ -757,16 +1218,42 @@ export default Plugin.define({
       }
     });
 
-    // (f) background event subscriber, bounded and abortable.
+    // (h) Shared background event subscriber (1 active stream per auditDir group + eventID dedupe).
     function logEvent(event) {
       const type = safeRead(event, 'type');
       const eventType = typeof type === 'string' ? type : 'unknown';
       const data = safeRead(event, 'data') ?? {};
+      const sessionID = safeRead(data, 'sessionID');
+      const eventLocation = safeRead(event, 'location');
+
+      if (typeof sessionID === 'string' && sessionID.length > 0 && eventLocation && safeRead(eventLocation, 'directory')) {
+        bus.updateSessionMeta(sessionID, {
+          directory: safeRead(eventLocation, 'directory'),
+          workspaceID: safeRead(eventLocation, 'workspaceID'),
+        });
+      }
+
+      const resolvedLocation = (() => {
+        if (eventLocation && typeof eventLocation === 'object' && safeRead(eventLocation, 'directory')) {
+          return optionalRedact(eventLocation);
+        }
+        const meta = typeof sessionID === 'string' ? bus.getSessionMeta(sessionID) : null;
+        if (meta?.directory) {
+          return {
+            directory: optionalRedact(meta.directory),
+            workspaceID: optionalRedact(meta.workspaceID),
+          };
+        }
+        return optionalRedact(eventLocation);
+      })();
+
       const payload = {
         eventID: optionalRedact(safeRead(event, 'id')),
-        sessionID: optionalRedact(safeRead(data, 'sessionID')),
-        location: optionalRedact(safeRead(event, 'location')),
+        sessionID: optionalRedact(sessionID),
+        location: resolvedLocation,
       };
+      const knownModel = resolveModelForSession(sessionID);
+      if (knownModel) payload.model = knownModel;
 
       switch (eventType) {
         case 'session.usage.updated':
@@ -787,8 +1274,12 @@ export default Plugin.define({
           payload.inputID = optionalRedact(safeRead(data, 'inputID'));
           break;
         case 'session.compaction.ended': {
+          const compactionModel = safeRead(data, 'model');
+          if (typeof sessionID === 'string' && compactionModel) {
+            bus.updateSessionMeta(sessionID, { model: compactionModel });
+          }
           payload.reason = optionalRedact(safeRead(data, 'reason'));
-          payload.model = optionalRedact(safeRead(data, 'model'));
+          payload.model = optionalRedact(compactionModel);
           payload.cost = optionalRedact(safeRead(data, 'cost'));
           payload.tokens = optionalRedact(safeRead(data, 'tokens'));
           const text = safeRead(data, 'text');
@@ -833,7 +1324,6 @@ export default Plugin.define({
           payload.reply = optionalRedact(safeRead(data, 'reply'));
           break;
         default:
-          // Unknown event shapes are still recorded, defensively redacted.
           payload.data = optionalRedact(data);
           break;
       }
@@ -841,70 +1331,32 @@ export default Plugin.define({
       record(eventType, payload);
     }
 
-    let eventsEnded = false;
-    const consumeEvents = (async () => {
-      try {
-        const eventDomain = safeRead(ctx, 'event');
-        if (!eventDomain || typeof eventDomain.subscribe !== 'function') return;
-        const stream = eventDomain.subscribe({
-          types: EVENT_TYPES,
-          signal: controller.signal,
-        });
-        for await (const event of stream) {
-          if (controller.signal.aborted) break;
-          try {
-            logEvent(event);
-          } catch (error) {
-            record('plugin.error', { where: 'event.handler', message: describeError(error) });
-          }
-        }
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          record('plugin.error', { where: 'event.subscriber', message: describeError(error) });
-        }
-      } finally {
-        eventsEnded = true;
-      }
-    })().catch(() => {
-      // The subscriber must never reject into OpenCode's runtime.
-      eventsEnded = true;
+    const busHandle = bus.registerInstance({
+      eventDomain: safeRead(ctx, 'event'),
+      eventTypes: EVENT_TYPES,
+      directory: locationDir,
+      onAuditEvent: logEvent,
+      onError: (where, error) => record('plugin.error', { where, message: describeError(error) }),
     });
 
     return async function cleanup() {
       if (cleaned) return cleanupPromise;
       cleaned = true;
       cleanupPromise = (async () => {
+        let subState = { aborted: false, ended: false, failedOver: false };
         try {
-          controller.abort();
+          subState = await busHandle.unregister();
         } catch {
           // ignore
         }
-        // Give the subscriber a moment to finish; never let teardown hang OpenCode.
-        try {
-          let timer;
-          await Promise.race([
-            consumeEvents,
-            new Promise((resolve) => {
-              timer = setTimeout(resolve, 1000);
-              if (typeof timer.unref === 'function') timer.unref();
-            }),
-          ]);
-          if (timer) clearTimeout(timer);
-        } catch {
-          // ignore
-        }
+
         const pending = registrations.splice(0, registrations.length);
         for (const registration of pending) {
-          // A hook's dispose() is host code: bound it so a hung implementation cannot make
-          // teardown (and therefore OpenCode exit) wait forever.
           let timer = null;
           try {
             const outcome = await Promise.race([
               Promise.resolve().then(() => registration.dispose()),
               new Promise((resolve) => {
-                // Deliberately ref'd: while a dispose() hangs, this timer is the only thing
-                // keeping the process alive long enough to enforce the bound. It is cleared
-                // as soon as the race settles, so a fast dispose leaves no handle behind.
                 timer = setTimeout(() => resolve(DISPOSE_TIMEOUT), DISPOSE_TIMEOUT_MS);
               }),
             ]);
@@ -927,8 +1379,9 @@ export default Plugin.define({
           plugin: PLUGIN_ID,
           hooksDisposed: pending.length,
           pendingCallTimings: calls.size,
-          eventSubscriberAborted: controller.signal.aborted,
-          eventSubscriberEnded: eventsEnded,
+          eventSubscriberAborted: subState.aborted,
+          eventSubscriberEnded: subState.ended,
+          eventSubscriberFailedOver: subState.failedOver,
         });
         calls.clear();
         try {

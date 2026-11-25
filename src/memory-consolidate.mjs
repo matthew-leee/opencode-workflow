@@ -23,13 +23,14 @@ import {
   createOpenRouterClientFromEnv,
   redactSecrets,
 } from "./openrouter-client.mjs";
+import { projectLabelFromWorkspace, readOpenCodeDbMetrics } from "./opencode-db.mjs";
 
 export const HARD_MEMORY_LIMIT = 2500;
 export const DEFAULT_MEMORY_MODEL = "deepseek/deepseek-v4.1-flash-1017";
 export const DEFAULT_MEMORY_DAYS = 14;
 export const DEFAULT_MEMORY_EVENTS = 400;
 const MAX_AUDIT_FILES = 500;
-const MAX_AUDIT_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_AUDIT_FILE_BYTES = 32 * 1024 * 1024;
 const TRUNCATION_MARKER = "\n\n_(truncated to fit the 2,500-character memory limit)_";
 const EMPTY_MEMORY_FALLBACK = "# MEMORY\n\nNo verified project memory has been recorded yet.\n";
 
@@ -95,9 +96,16 @@ function walkJsonl(dir, files, depth = 0) {
   }
 }
 
-/** Finds JSONL audit files under the supplied directories (or files themselves). */
+/**
+ * Finds JSONL audit files under the supplied directories (or files themselves).
+ * When explicit non-empty `dirs` are provided, ONLY those directories/files are scanned so
+ * isolated CLI runs and unit tests never silently pool records from `~/.local/share/...`.
+ */
 export function discoverAuditFiles({ dirs = [], workspace, maxFiles = MAX_AUDIT_FILES } = {}) {
-  const roots = unique([...(dirs ?? []), ...defaultAuditDirs({ workspace: workspace ?? process.cwd() })]);
+  const explicit = unique((dirs ?? []).map((dir) => (typeof dir === "string" && dir.trim() ? resolve(dir.trim()) : "")));
+  const roots = explicit.length > 0
+    ? explicit
+    : defaultAuditDirs({ workspace: workspace ?? process.cwd() });
   const files = [];
   for (const root of roots) {
     if (files.length >= maxFiles) break;
@@ -195,7 +203,7 @@ function entryProject(entry) {
   const explicit = explicitProject(entry);
   if (explicit) return explicit;
   const workspace = entryWorkspace(entry);
-  return workspace ? basename(workspace) : "";
+  return workspace ? projectLabelFromWorkspace(workspace) : "";
 }
 
 function isAbsoluteFsPath(value) {
@@ -319,12 +327,52 @@ export function buildSessionAttribution(entries) {
   return { workspaces, projects };
 }
 
+function entryEventId(entry) {
+  const value = entry?.eventID ?? entry?.eventId ?? entry?.data?.eventID;
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : "";
+}
+
+/**
+ * Deduplicate records that share an identical `eventID` (historical logs written by
+ * multi-location daemons before Wave 1's shared bus carry 3x-37x copies per eventID).
+ * Keeps the richest record (preferring one that has an explicit `location.directory` / `model`).
+ */
+export function deduplicateRawAuditRows(rawRows) {
+  const byEventId = new Map();
+  const deduped = [];
+  let duplicatesRemoved = 0;
+
+  for (const item of rawRows) {
+    const id = entryEventId(item.entry);
+    if (!id) {
+      deduped.push(item);
+      continue;
+    }
+    const existingIdx = byEventId.get(id);
+    if (existingIdx === undefined) {
+      byEventId.set(id, deduped.length);
+      deduped.push(item);
+      continue;
+    }
+    duplicatesRemoved += 1;
+    const prev = deduped[existingIdx];
+    const score = (entry) => (entryWorkspace(entry) ? 2 : 0) + (modelRef(entry) ? 1 : 0);
+    if (score(item.entry) > score(prev.entry)) {
+      deduped[existingIdx] = item;
+    }
+  }
+
+  return { rows: deduped, duplicatesRemoved };
+}
+
 /**
  * Reads audit entries.
  *
  * `workspace` scopes entries to one project; omit it to read all projects (the RSI pruner does
  * this). Entries without a timestamp are treated as undated and kept, because older audit
  * formats may omit it; `days` only filters entries that do carry a timestamp.
+ * Optional `sessionDirectoryMap` and `sessionModelMap` (e.g. from read-only `opencode.db`)
+ * backfill workspace and model attribution for historical records that lacked them.
  */
 export function readAuditEntries({
   dirs = [],
@@ -333,6 +381,8 @@ export function readAuditEntries({
   now = Date.now(),
   maxEvents = null,
   includeUndated = true,
+  sessionDirectoryMap = null,
+  sessionModelMap = null,
 } = {}) {
   const files = discoverAuditFiles({ dirs, workspace });
   const cutoff = Number.isFinite(Number(days)) && Number(days) > 0
@@ -346,10 +396,18 @@ export function readAuditEntries({
     for (const entry of rows) raw.push({ entry, file });
   }
 
-  const attribution = buildSessionAttribution(raw.map((item) => item.entry));
+  const { rows: uniqueRows, duplicatesRemoved } = deduplicateRawAuditRows(raw);
+  const attribution = buildSessionAttribution(uniqueRows.map((item) => item.entry));
+  if (sessionDirectoryMap && typeof sessionDirectoryMap.entries === "function") {
+    for (const [sid, dir] of sessionDirectoryMap.entries()) {
+      if (sid && dir && !attribution.workspaces.has(sid)) {
+        attribution.workspaces.set(sid, dir);
+      }
+    }
+  }
   const collected = [];
 
-  for (const { entry, file } of raw) {
+  for (const { entry, file } of uniqueRows) {
     const timestamp = entryTimestamp(entry);
     if (timestamp === null && !includeUndated) continue;
     if (timestamp !== null && timestamp < cutoff) continue;
@@ -359,13 +417,17 @@ export function readAuditEntries({
     const project =
       explicitProject(entry) ||
       (session ? attribution.projects.get(session) ?? "" : "") ||
-      (candidate ? basename(candidate) : "");
+      (candidate ? projectLabelFromWorkspace(candidate) : "");
     if (!matchesWorkspace({ candidate, project, sourceFile: file }, workspace)) continue;
+    const inferredModel = !modelRef(entry) && session && sessionModelMap?.get(session)
+      ? sessionModelMap.get(session)
+      : undefined;
     collected.push({
       ...entry,
+      ...(inferredModel ? { __model: inferredModel } : {}),
       __timestamp: timestamp,
       __sourceFile: file,
-      __project: project || (workspace ? basename(workspace) : "unknown"),
+      __project: project || (workspace ? projectLabelFromWorkspace(workspace) : "unknown"),
       __session: session,
     });
   }
@@ -374,7 +436,7 @@ export function readAuditEntries({
   const entries = Number.isFinite(maxEvents) && maxEvents > 0
     ? collected.slice(-Math.floor(maxEvents))
     : collected;
-  return { entries, files, skippedLines, totalMatching: collected.length };
+  return { entries, files, skippedLines, deduplicatedEvents: duplicatesRemoved, totalMatching: collected.length };
 }
 
 function typeOf(entry) {
@@ -444,7 +506,7 @@ function commandRef(entry) {
 
 function modelRef(entry) {
   const value =
-    entry?.model ?? entry?.modelID ?? entry?.modelId ?? entry?.data?.model ?? entry?.data?.modelID ??
+    entry?.model ?? entry?.__model ?? entry?.modelID ?? entry?.modelId ?? entry?.data?.model ?? entry?.data?.modelID ??
     entry?.data?.modelId;
   if (typeof value === "string" && value) return value;
   // OpenCode forwards the compaction model as an object ({ providerID, modelID }) or as an id.
@@ -471,7 +533,7 @@ function costRef(entry) {
 }
 
 /** Compact, deterministic telemetry summary used in the consolidation prompt. */
-export function summarizeAuditEntries(entries, { maxSessions = 24, maxActionsPerSession = 10 } = {}) {
+export function summarizeAuditEntries(entries, { maxSessions = 24, maxActionsPerSession = 10, dbMetrics = null } = {}) {
   const sessions = new Map();
   const global = {
     entries: entries.length,
@@ -572,6 +634,46 @@ export function summarizeAuditEntries(entries, { maxSessions = 24, maxActionsPer
     }
   }
 
+  // Merge authoritative session/model/cost facts from read-only `opencode.db` when supplied.
+  if (dbMetrics?.available) {
+    for (const dbSession of dbMetrics.sessions ?? []) {
+      global.projects.add(dbSession.project);
+      global.sessions.add(dbSession.id);
+      let session = sessions.get(dbSession.id);
+      if (!session) {
+        session = {
+          id: dbSession.id,
+          project: dbSession.project,
+          first: dbSession.timeCreated ?? null,
+          last: dbSession.timeUpdated ?? null,
+          tools: 0,
+          errors: 0,
+          cost: dbSession.costUSD,
+          model: dbSession.model || "",
+          actions: dbSession.title ? [`title:${dbSession.title.slice(0, 80)}`] : [],
+          files: new Set(),
+          commands: new Set(),
+        };
+        sessions.set(dbSession.id, session);
+      } else {
+        if (dbSession.project && dbSession.project !== "unknown") session.project = dbSession.project;
+        if (dbSession.model) session.model = dbSession.model;
+        if (Number.isFinite(dbSession.costUSD) && dbSession.costUSD > session.cost) {
+          session.cost = dbSession.costUSD;
+        }
+        if (dbSession.timeUpdated && (!session.last || dbSession.timeUpdated > session.last)) {
+          session.last = dbSession.timeUpdated;
+        }
+      }
+    }
+    if (Array.isArray(dbMetrics.models) && dbMetrics.models.length > 0) {
+      global.models.clear();
+      for (const m of dbMetrics.models) {
+        global.models.set(m.model, { turns: m.turns, cost: m.costUSD, errors: m.errors });
+      }
+    }
+  }
+
   const orderedSessions = [...sessions.values()]
     .filter((session) => isAttributedSession(session.id))
     .sort((a, b) => (b.last ?? 0) - (a.last ?? 0))
@@ -600,9 +702,12 @@ export function summarizeAuditEntries(entries, { maxSessions = 24, maxActionsPer
       skillsUsed: [...global.skillsUsed].sort(),
       models: [...global.models.entries()]
         .map(([model, stat]) => ({ model, turns: stat.turns, costUSD: Number(stat.cost.toFixed(4)), errors: stat.errors }))
-        .sort((a, b) => b.turns - a.turns),
+        .sort((a, b) => b.costUSD - a.costUSD || b.turns - a.turns),
       files: [...global.files].slice(0, 20),
       commands: [...global.commands].slice(0, 15),
+      totalCostUSD: dbMetrics?.available
+        ? dbMetrics.totalCostUSD
+        : Number([...sessions.values()].reduce((sum, s) => sum + s.cost, 0).toFixed(4)),
     },
     sessions: orderedSessions,
   };
@@ -808,14 +913,29 @@ export async function consolidateMemory(options = {}) {
   const auditDirs = options.auditDirs ?? (options.auditDir ? [options.auditDir] : []);
 
   const existingMemory = existsSync(memoryPath) ? readFileSync(memoryPath, "utf8") : "";
+  const days = options.days ?? DEFAULT_MEMORY_DAYS;
+  const now = options.now ?? Date.now();
+  // Auto-read authoritative opencode.db metrics unless explicitly disabled or running against
+  // explicit isolated auditDirs without an explicit dbPath.
+  const effectiveDbPath = options.dbPath !== undefined
+    ? options.dbPath
+    : (auditDirs.length > 0 ? false : undefined);
+  const dbMetrics = await readOpenCodeDbMetrics({
+    dbPath: effectiveDbPath,
+    workspace,
+    days,
+    now,
+  });
   const scan = readAuditEntries({
     dirs: auditDirs,
     workspace,
-    days: options.days ?? DEFAULT_MEMORY_DAYS,
-    now: options.now ?? Date.now(),
+    days,
+    now,
     maxEvents: options.maxEvents ?? DEFAULT_MEMORY_EVENTS,
+    sessionDirectoryMap: dbMetrics.available ? dbMetrics.sessionDirectoryMap : null,
+    sessionModelMap: dbMetrics.available ? dbMetrics.sessionModelMap : null,
   });
-  const summary = summarizeAuditEntries(scan.entries);
+  const summary = summarizeAuditEntries(scan.entries, { dbMetrics });
   const messages = buildConsolidationMessages({
     project,
     workspace,
@@ -912,6 +1032,8 @@ function parseCliArgs(argv) {
     if (arg === "--workspace") options.workspace = next();
     else if (arg === "--project") options.project = next();
     else if (arg === "--audit-dir") options.auditDirs.push(next());
+    else if (arg === "--db") options.dbPath = next();
+    else if (arg === "--no-db") options.dbPath = false;
     else if (arg === "--memory") options.memoryPath = next();
     else if (arg === "--days") options.days = Number(next());
     else if (arg === "--max-events") options.maxEvents = Number(next());

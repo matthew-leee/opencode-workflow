@@ -843,10 +843,18 @@ test('plugin loads, records every hook and event, then cleans up idempotently', 
 
   const cleanup = await auditPlugin.setup(mock.ctx);
   assert.equal(typeof cleanup, 'function');
-  assert.equal(mock.registrations.length, 5);
+  assert.equal(mock.registrations.length, 7);
   assert.deepEqual(
     mock.registrations.map((registration) => registration.key).sort(),
-    ['permission.evaluate', 'session.prompt', 'shell.create.before', 'tool.execute.after', 'tool.execute.before'],
+    [
+      'permission.evaluate',
+      'session.context',
+      'session.experimental.idle',
+      'session.prompt',
+      'shell.create.before',
+      'tool.execute.after',
+      'tool.execute.before',
+    ],
   );
 
   // plugin.loaded is written synchronously before setup returns.
@@ -1055,7 +1063,7 @@ test('plugin loads, records every hook and event, then cleans up idempotently', 
   const stopped = allRecords(auditDir).filter((record) => record.event === 'plugin.stopped');
   assert.equal(stopped.length, 1);
   assert.equal(stopped[0].plugin, PLUGIN_ID);
-  assert.equal(stopped[0].hooksDisposed, 5);
+  assert.equal(stopped[0].hooksDisposed, 7);
   assert.equal(stopped[0].eventSubscriberAborted, true);
   assert.equal(stopped[0].eventSubscriberEnded, true);
 
@@ -1251,7 +1259,7 @@ test('plugin survives an event stream that fails immediately and a throwing disp
 // --- real OpenCode smoke test -----------------------------------------------------
 
 test(
-  'real OpenCode v2.3.2 loads the plugin with zero load warnings and writes plugin.loaded',
+  'real OpenCode v2 binary loads the plugin with zero load warnings and writes plugin.loaded',
   { timeout: 180_000 },
   (t) => {
     if (!fs.existsSync(OPENCODE_BIN)) {
@@ -1261,11 +1269,9 @@ test(
 
     const version = spawnSync(OPENCODE_BIN, ['--version'], { encoding: 'utf8', timeout: 60_000 });
     assert.equal(version.status, 0, version.stderr);
-    assert.match(
-      version.stdout.trim(),
-      /^opencode v?2\.3\.2$/,
-      'the smoke test targets OpenCode 2.3.2',
-    );
+    const versionMatch = version.stdout.trim().match(/^opencode v?(2\.\d+\.\d+)$/);
+    assert.ok(versionMatch, `expected OpenCode v2.x, got ${version.stdout.trim()}`);
+    const installedVersion = versionMatch[1];
 
     const root = makeTempDir(t, 'ocw-opencode-smoke-');
     const home = path.join(root, 'home');
@@ -1349,7 +1355,7 @@ test(
     const loaded = records.find((record) => record.event === 'plugin.loaded');
     assert.ok(loaded, 'real OpenCode run did not write plugin.loaded');
     assert.equal(loaded.plugin, PLUGIN_ID);
-    assert.equal(loaded.app.version, '2.3.2');
+    assert.equal(loaded.app.version, installedVersion);
     assert.equal(loaded.auditDir, auditDir);
     assert.equal(loaded.loggingEnabled, true);
     assert.ok(path.isAbsolute(loaded.location.directory), 'location.directory should be absolute');

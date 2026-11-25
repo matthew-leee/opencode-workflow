@@ -23,102 +23,15 @@
     }
   },
 
-  // Ordered rules — later rules win. Everyday inspection/test/build stays silent;
-  // destructive or externally-visible mutations ask. Both `bash` and `shell` action names are
-  // listed because the shell tool is addressable under either name depending on the code path.
+  // Ordered rules — later rules win. Everyday inspection/test/build stays silent.
+  // Concise static baseline here; structured shell command parsing (real `.env` secrets,
+  // destructive local ops, remote/infra/DB mutations, while staying silent on `.env.example`
+  // and `process.env` in code) runs in `plugins/audit-logger/permission-guard.js` via
+  // `permission.hook("evaluate")`.
   "permissions": [
     { "action": "*", "resource": "*", "effect": "allow" },
 
-    // Local destructive / irreversible
-    { "action": "bash", "resource": "rm -rf*", "effect": "ask" },
-    { "action": "shell", "resource": "rm -rf*", "effect": "ask" },
-    { "action": "bash", "resource": "rm -r*", "effect": "ask" },
-    { "action": "shell", "resource": "rm -r*", "effect": "ask" },
-    { "action": "bash", "resource": "git reset*", "effect": "ask" },
-    { "action": "shell", "resource": "git reset*", "effect": "ask" },
-    { "action": "bash", "resource": "git clean*", "effect": "ask" },
-    { "action": "shell", "resource": "git clean*", "effect": "ask" },
-    { "action": "bash", "resource": "git checkout --*", "effect": "ask" },
-    { "action": "shell", "resource": "git checkout --*", "effect": "ask" },
-    { "action": "bash", "resource": "git restore*", "effect": "ask" },
-    { "action": "shell", "resource": "git restore*", "effect": "ask" },
-    { "action": "bash", "resource": "git rebase*", "effect": "ask" },
-    { "action": "shell", "resource": "git rebase*", "effect": "ask" },
-    { "action": "bash", "resource": "git commit --amend*", "effect": "ask" },
-    { "action": "shell", "resource": "git commit --amend*", "effect": "ask" },
-    { "action": "bash", "resource": "git filter-branch*", "effect": "ask" },
-    { "action": "shell", "resource": "git filter-branch*", "effect": "ask" },
-    { "action": "bash", "resource": "git stash drop*", "effect": "ask" },
-    { "action": "shell", "resource": "git stash drop*", "effect": "ask" },
-    { "action": "bash", "resource": "git stash clear*", "effect": "ask" },
-    { "action": "shell", "resource": "git stash clear*", "effect": "ask" },
-    { "action": "bash", "resource": "git worktree remove*", "effect": "ask" },
-    { "action": "shell", "resource": "git worktree remove*", "effect": "ask" },
-    { "action": "bash", "resource": "kill*", "effect": "ask" },
-    { "action": "shell", "resource": "kill*", "effect": "ask" },
-    { "action": "bash", "resource": "chown*", "effect": "ask" },
-    { "action": "shell", "resource": "chown*", "effect": "ask" },
-    { "action": "bash", "resource": "sudo*", "effect": "ask" },
-    { "action": "shell", "resource": "sudo*", "effect": "ask" },
-
-    // Remote / publish / infrastructure / data mutation
-    { "action": "bash", "resource": "git push*", "effect": "ask" },
-    { "action": "shell", "resource": "git push*", "effect": "ask" },
-    { "action": "bash", "resource": "git remote*", "effect": "ask" },
-    { "action": "shell", "resource": "git remote*", "effect": "ask" },
-    { "action": "bash", "resource": "npm publish*", "effect": "ask" },
-    { "action": "shell", "resource": "npm publish*", "effect": "ask" },
-    { "action": "bash", "resource": "npm unpublish*", "effect": "ask" },
-    { "action": "shell", "resource": "npm unpublish*", "effect": "ask" },
-    { "action": "bash", "resource": "cargo publish*", "effect": "ask" },
-    { "action": "shell", "resource": "cargo publish*", "effect": "ask" },
-    { "action": "bash", "resource": "npm i -g*", "effect": "ask" },
-    { "action": "shell", "resource": "npm i -g*", "effect": "ask" },
-    { "action": "bash", "resource": "npm install -g*", "effect": "ask" },
-    { "action": "shell", "resource": "npm install -g*", "effect": "ask" },
-    { "action": "bash", "resource": "ssh*", "effect": "ask" },
-    { "action": "shell", "resource": "ssh*", "effect": "ask" },
-    { "action": "bash", "resource": "scp*", "effect": "ask" },
-    { "action": "shell", "resource": "scp*", "effect": "ask" },
-    { "action": "bash", "resource": "rsync*", "effect": "ask" },
-    { "action": "shell", "resource": "rsync*", "effect": "ask" },
-    { "action": "bash", "resource": "curl -X*", "effect": "ask" },
-    { "action": "shell", "resource": "curl -X*", "effect": "ask" },
-    { "action": "bash", "resource": "curl --data*", "effect": "ask" },
-    { "action": "shell", "resource": "curl --data*", "effect": "ask" },
-    { "action": "bash", "resource": "curl -d*", "effect": "ask" },
-    { "action": "shell", "resource": "curl -d*", "effect": "ask" },
-    { "action": "bash", "resource": "docker rm*", "effect": "ask" },
-    { "action": "shell", "resource": "docker rm*", "effect": "ask" },
-    { "action": "bash", "resource": "docker rmi*", "effect": "ask" },
-    { "action": "shell", "resource": "docker rmi*", "effect": "ask" },
-    { "action": "bash", "resource": "docker system prune*", "effect": "ask" },
-    { "action": "shell", "resource": "docker system prune*", "effect": "ask" },
-    { "action": "bash", "resource": "docker push*", "effect": "ask" },
-    { "action": "shell", "resource": "docker push*", "effect": "ask" },
-    { "action": "bash", "resource": "systemctl*", "effect": "ask" },
-    { "action": "shell", "resource": "systemctl*", "effect": "ask" },
-    { "action": "bash", "resource": "psql*", "effect": "ask" },
-    { "action": "shell", "resource": "psql*", "effect": "ask" },
-    { "action": "bash", "resource": "mysql*", "effect": "ask" },
-    { "action": "shell", "resource": "mysql*", "effect": "ask" },
-    { "action": "bash", "resource": "sqlite3*", "effect": "ask" },
-    { "action": "shell", "resource": "sqlite3*", "effect": "ask" },
-    { "action": "bash", "resource": "gcloud *", "effect": "ask" },
-    { "action": "shell", "resource": "gcloud *", "effect": "ask" },
-    { "action": "bash", "resource": "aws *", "effect": "ask" },
-    { "action": "shell", "resource": "aws *", "effect": "ask" },
-    { "action": "bash", "resource": "terraform apply*", "effect": "ask" },
-    { "action": "shell", "resource": "terraform apply*", "effect": "ask" },
-    { "action": "bash", "resource": "terraform destroy*", "effect": "ask" },
-    { "action": "shell", "resource": "terraform destroy*", "effect": "ask" },
-    { "action": "bash", "resource": "kubectl delete*", "effect": "ask" },
-    { "action": "shell", "resource": "kubectl delete*", "effect": "ask" },
-
-    // Secrets. These must stay after the baseline allow so they are not overridden.
-    // `.env` and `.env.*` are gated on every file surface (read/edit/write/patch) and on the
-    // shell, where a resource is the command line, not a path. Command-shaped globs catch
-    // `cat .env`, `cat ./.env`, `cat .env foo`, and a bare trailing `*.env`.
+    // Secret files on single-path file tools (unambiguous path globs).
     { "action": "read", "resource": "*.env", "effect": "ask" },
     { "action": "read", "resource": "*.env.*", "effect": "ask" },
     { "action": "edit", "resource": "*.env", "effect": "ask" },
@@ -127,32 +40,32 @@
     { "action": "write", "resource": "*.env.*", "effect": "ask" },
     { "action": "patch", "resource": "*.env", "effect": "ask" },
     { "action": "patch", "resource": "*.env.*", "effect": "ask" },
-    { "action": "bash", "resource": "*.env*", "effect": "ask" },
-    { "action": "shell", "resource": "*.env*", "effect": "ask" },
-    { "action": "bash", "resource": "* .env*", "effect": "ask" },
-    { "action": "shell", "resource": "* .env*", "effect": "ask" },
-    { "action": "bash", "resource": "*/*.env*", "effect": "ask" },
-    { "action": "shell", "resource": "*/*.env*", "effect": "ask" },
-    { "action": "bash", "resource": "*.env *", "effect": "ask" },
-    { "action": "shell", "resource": "*.env *", "effect": "ask" },
-    { "action": "bash", "resource": "*.env", "effect": "ask" },
-    { "action": "shell", "resource": "*.env", "effect": "ask" },
     { "action": "read", "resource": "*id_rsa*", "effect": "ask" },
+    { "action": "read", "resource": "*id_ed25519*", "effect": "ask" },
     { "action": "read", "resource": "*.pem", "effect": "ask" },
     { "action": "read", "resource": "*/secrets/*", "effect": "ask" },
-    // Explicit template escape hatch for FILE-PATH tools only, declared after every ask so
-    // later-wins ordering keeps `.env.example` readable/writable while real `.env` files ask.
-    // `read`/`edit`/`write`/`patch` resources are a single file path, so a `*.env.example` glob
-    // cannot match anything else.
+
+    // Template escape hatch for single-path file tools only (declared after the ask rules).
     { "action": "read", "resource": "*.env.example", "effect": "allow" },
     { "action": "edit", "resource": "*.env.example", "effect": "allow" },
     { "action": "write", "resource": "*.env.example", "effect": "allow" },
     { "action": "patch", "resource": "*.env.example", "effect": "allow" },
-    // Deliberately NO allow for `shell`/`bash`. Their resource is the whole command string, so a
-    // trailing-glob allow would let a command that merely ends in `.env.example` through while
-    // still reading a real `.env`: `cat .env # .env.example` or `cat .env; cat .env.example` would
-    // match `*.env.example` and bypass the `.env` ask. Any command mentioning `.env*` therefore
-    // fails closed to `ask` via the command-glob rules above.
+
+    // Fail-closed static fallbacks if plugins are ever disabled (high-impact destructive/remote
+    // ops plus shell `.env*`). At runtime, `permission-guard.js` parses shell commands cleanly:
+    // asks on real `.env`/`.env.local` and all destructive/remote/infra/DB mutations, while
+    // overriding the static `*.env*` fallback to `allow` ONLY when every `.env` token is a safe
+    // template (`.env.example`) or code identifier (`process.env`).
+    { "action": "shell", "resource": "rm -rf*", "effect": "ask" },
+    { "action": "bash", "resource": "rm -rf*", "effect": "ask" },
+    { "action": "shell", "resource": "git push*", "effect": "ask" },
+    { "action": "bash", "resource": "git push*", "effect": "ask" },
+    { "action": "shell", "resource": "git reset*", "effect": "ask" },
+    { "action": "bash", "resource": "git reset*", "effect": "ask" },
+    { "action": "shell", "resource": "sudo*", "effect": "ask" },
+    { "action": "bash", "resource": "sudo*", "effect": "ask" },
+    { "action": "shell", "resource": "*.env*", "effect": "ask" },
+    { "action": "bash", "resource": "*.env*", "effect": "ask" },
   ],
 
   "agents": {
