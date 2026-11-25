@@ -2136,3 +2136,188 @@ test('shared-bus: getSharedSlot never collides with Object prototype keys', (t) 
     'slot-constructor',
   );
 });
+
+// ===========================================================================
+// 8. POINT 2 REGRESSIONS — hot-reload recorder failover + immediate visibility
+// ===========================================================================
+
+test('shared-bus: addRecorder routes to live recorders, skips false/throws, and fails over after release', (t) => {
+  const dir = makeTempDir(t);
+  const bus = getSharedBus(path.join(dir, 'audit'));
+  const calls = [];
+
+  const releaseOld = bus.addRecorder((event, data) => {
+    calls.push(['old', event, data]);
+    return true;
+  });
+  // Newest recorder simulates a closed audit log (returns false, e.g. after hot-reload).
+  const releaseClosed = bus.addRecorder((event, data) => {
+    calls.push(['closed', event, data]);
+    return false;
+  });
+
+  assert.equal(bus.record('guard.action', { n: 1 }), true, 'older live recorder must take over');
+  assert.deepEqual(calls.map((call) => call[0]), ['closed', 'old']);
+  assert.equal(calls[0][2].n, 1);
+
+  calls.length = 0;
+  releaseClosed();
+  assert.equal(bus.record('guard.action', { n: 2 }), true, 'released recorder is never called');
+  assert.deepEqual(calls.map((call) => call[0]), ['old']);
+
+  // A throwing recorder is skipped too.
+  const releaseThrowing = bus.addRecorder(() => {
+    calls.push(['throwing']);
+    throw new Error('closed log');
+  });
+  calls.length = 0;
+  assert.equal(bus.record('guard.action', { n: 3 }), true);
+  assert.deepEqual(calls.map((call) => call[0]), ['throwing', 'old']);
+
+  releaseThrowing();
+  releaseOld();
+  calls.length = 0;
+  assert.equal(bus.record('guard.action', { n: 4 }), false, 'no live recorders -> false');
+  assert.equal(calls.length, 0);
+
+  // Non-function registration is a safe no-op.
+  const releaseBad = bus.addRecorder(null);
+  assert.equal(typeof releaseBad, 'function');
+  releaseBad();
+});
+
+test('plugin hot-reload: shared reactive guard keeps recording guard.action after the first instance closes its log', async (t) => {
+  resetSharedBusForTests();
+  const root = makeTempDir(t);
+  const project = path.join(root, 'project');
+  fs.mkdirSync(project);
+  const auditDir = path.join(root, 'audit');
+  const blackboardDir = path.join(root, 'bb');
+  // No OpenRouter key: Layer 1D deterministic fallback runs fully offline for identical_errors.
+  useEnv(t, {
+    OPENROUTER_API_KEY: undefined,
+    [AUDIT_DIR_ENV]: auditDir,
+    [BLACKBOARD_DIR_ENV]: blackboardDir,
+  });
+
+  let cleanup1;
+  let cleanup2;
+  try {
+    const mock1 = createMockContext({ directory: project });
+    const mock2 = createMockContext({ directory: project });
+    cleanup1 = await auditPlugin.setup(mock1.ctx);
+    cleanup2 = await auditPlugin.setup(mock2.ctx);
+
+    // Hot-reload: instance #1 unloads while instance #2 stays registered on the same bus group.
+    await cleanup1();
+    cleanup1 = null;
+
+    await mock2.call('session.prompt', {
+      sessionID: 'ses_reload',
+      prompt: { text: 'Fix the failing build' },
+    });
+    for (let i = 0; i < 3; i += 1) {
+      await mock2.call('tool.execute.after', {
+        id: `reload_${i}`,
+        tool: 'shell',
+        sessionID: 'ses_reload',
+        agent: 'build',
+        status: 'error',
+        input: { command: 'npm test' },
+        error: 'Error: same failure',
+      });
+    }
+
+    const guardActions = readAllJsonl(auditDir).filter((entry) => entry.event === 'guard.action');
+    assert.equal(guardActions.length, 1, 'guard.action must survive the hot-reload');
+    assert.equal(guardActions[0].sessionID, 'ses_reload');
+    assert.equal(guardActions[0].tripwire, 'identical_errors');
+    assert.equal(guardActions[0].ok, true);
+  } finally {
+    if (cleanup1) await cleanup1();
+    if (cleanup2) await cleanup2();
+    resetSharedBusForTests();
+  }
+});
+
+test('rotate_session updates the old session title immediately, strips stale prefixes, and never touches metadata', async () => {
+  const { guard, ctx } = makeGuard({
+    createIds: ['ses_new_title'],
+    judge: async () => ({ action: 'rotate_session', rationale: 'post-compaction bloat' }),
+  });
+
+  const updates = [];
+  ctx.session.get = async ({ sessionID }) => ({ title: '[Rotated -> ses_prev] Keep building the widget' });
+  ctx.session.update = async (args) => {
+    updates.push(args);
+    return {};
+  };
+
+  guard.onPrompt({ sessionID: 'ses_old_title', text: 'Build the widget', directory: null });
+  await tripRotation(guard, ctx, 'ses_old_title');
+
+  assert.equal(updates.length, 1, 'exactly one title update');
+  const call = updates[0];
+  assert.deepEqual(Object.keys(call), ['sessionID', 'title']);
+  assert.equal(call.sessionID, 'ses_old_title');
+  assert.equal(call.title, '[Rotated -> ses_new_title] Keep building the widget');
+  assert.equal('metadata' in call, false, 'session.update must never overwrite metadata.openchamber');
+  assert.equal(guard.getSessionState('ses_old_title').rotatedTo, 'ses_new_title');
+});
+
+test('hard_stop updates the session title immediately with the tripwire kind', async () => {
+  const { guard, ctx, guardActions } = makeGuard({
+    judge: async () => ({ action: 'continue' }),
+  });
+
+  const updates = [];
+  ctx.session.get = async () => ({ title: 'Long running build' });
+  ctx.session.update = async (args) => {
+    updates.push(args);
+    return {};
+  };
+
+  guard.onPrompt({ sessionID: 'ses_stop_title', text: 'Stop the runaway build', directory: null });
+  await guard.onUsageUpdated({ sessionID: 'ses_stop_title', cost: 15.0, ctx });
+
+  const actions = guardActions();
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].action, 'hard_stop');
+  assert.equal(updates.length, 1);
+  const call = updates[0];
+  assert.deepEqual(Object.keys(call), ['sessionID', 'title']);
+  assert.equal(call.sessionID, 'ses_stop_title');
+  assert.equal(call.title, '[HARD STOP: hard_spend_fuse] Long running build');
+});
+
+test('a throwing ctx.session.update never fails a completed rotation or hard stop', async () => {
+  const rotated = makeGuard({
+    createIds: ['ses_new_throw'],
+    judge: async () => ({ action: 'rotate_session', rationale: 'bloat' }),
+  });
+  rotated.ctx.session.update = async () => {
+    throw new Error('update exploded');
+  };
+  rotated.guard.onPrompt({ sessionID: 'ses_old_throw', text: 'goal', directory: null });
+  await tripRotation(rotated.guard, rotated.ctx, 'ses_old_throw');
+
+  const rotatedActions = rotated.guardActions();
+  assert.equal(rotatedActions.length, 1);
+  assert.equal(rotatedActions[0].action, 'rotate_session');
+  assert.equal(rotatedActions[0].ok, true, 'a cosmetic title failure must not fail the rotation');
+  assert.equal(rotatedActions[0].newSessionID, 'ses_new_throw');
+  assert.equal(rotated.guard.getSessionState('ses_old_throw').rotatedTo, 'ses_new_throw');
+
+  const stopped = makeGuard({ judge: async () => ({ action: 'continue' }) });
+  stopped.ctx.session.update = async () => {
+    throw new Error('update exploded');
+  };
+  stopped.guard.onPrompt({ sessionID: 'ses_stop_throw', text: 'goal', directory: null });
+  await stopped.guard.onUsageUpdated({ sessionID: 'ses_stop_throw', cost: 15.0, ctx: stopped.ctx });
+
+  const stoppedActions = stopped.guardActions();
+  assert.equal(stoppedActions.length, 1);
+  assert.equal(stoppedActions[0].action, 'hard_stop');
+  assert.equal(stoppedActions[0].ok, true, 'a cosmetic title failure must not fail the hard stop');
+});
+

@@ -710,11 +710,16 @@ export default Plugin.define({
 
     const record = (event, data = {}) => {
       try {
-        log.record(event, data);
+        return log.record(event, data);
       } catch {
         // createAuditLog().record already swallows; this is belt and braces.
+        return false;
       }
     };
+
+    // Register this instance's writer with the shared group so guard records keep flowing after a
+    // hot-reload closes an older instance's audit log (see shared-bus `record()` failover).
+    const releaseRecorder = bus.addRecorder(record);
 
     const guardOptions = safeRead(ctx?.options, 'guard');
     const onSessionRotated = ({ newSessionID, rootSessionID, directory, agent, model }) => {
@@ -736,7 +741,10 @@ export default Plugin.define({
         : bus.getSharedSlot('reactiveGuard', () =>
             createReactiveGuard({
               blackboard,
-              record,
+              // Route through the shared group's live-recorder failover: the process-wide guard
+              // outlives any single plugin instance, so it must not capture this instance's
+              // `log` closure (which `log.close()` would silence after a hot-reload).
+              record: (event, data) => bus.record(event, data),
               onSessionRotated,
             }),
           );
@@ -1609,6 +1617,13 @@ export default Plugin.define({
           eventSubscriberFailedOver: subState.failedOver,
         });
         calls.clear();
+        // Release our shared recorder BEFORE closing this instance's log so the process-wide
+        // reactive guard can never be left pointing at a closed writer.
+        try {
+          releaseRecorder();
+        } catch {
+          // Teardown must not throw.
+        }
         try {
           log.close();
         } catch {

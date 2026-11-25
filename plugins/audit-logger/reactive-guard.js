@@ -728,6 +728,38 @@ export function buildRotationHandoffPrompt({ chain, oldSessionID, reason, direct
 }
 
 /**
+ * Immediately reflect a guard action in the session's title (sidebar/header) while idle.
+ *
+ * `ctx.session.synthetic({ delivery: 'queue', resume: false })` only enqueues into
+ * `session_inbox` and is not visible until the old chat is next woken, so a rotation/hard stop
+ * would otherwise look like nothing happened. `session.update` is the only immediately visible
+ * surface. Never pass `metadata`: `session.update` replaces the record, which would drop
+ * `metadata.openchamber`.
+ */
+async function updateSessionTitleBestEffort(ctx, sessionID, prefix, fallbackGoal) {
+  try {
+    if (typeof ctx?.session?.update !== 'function' || !sessionID) return;
+    let baseTitle = fallbackGoal || 'Session';
+    try {
+      const current = await ctx?.session?.get?.({ sessionID });
+      const currentTitle = current?.title ?? current?.name;
+      if (typeof currentTitle === 'string' && currentTitle.trim().length > 0) {
+        baseTitle = currentTitle.trim();
+      }
+    } catch {
+      // Best-effort read only; fall back to the chain goal.
+    }
+    // Never stack repeated guard prefixes on an already-annotated title.
+    baseTitle = baseTitle.replace(/^\[(?:Rotated\s*->[^\]]*|HARD STOP:[^\]]*)\]\s*/i, '').trim();
+    if (baseTitle.length === 0) baseTitle = fallbackGoal || 'Session';
+    const title = `${prefix} ${redactString(baseTitle, { maxLength: 60 })}`;
+    await ctx.session.update({ sessionID, title });
+  } catch {
+    // A cosmetic title update must never break a completed rotation or hard stop.
+  }
+}
+
+/**
  * Create the in-process Always-On Reactive Security Guard instance (one per plugin/bus group).
  */
 export function createReactiveGuard(options = {}) {
@@ -1099,8 +1131,19 @@ export function createReactiveGuard(options = {}) {
             // ignore: rotation already completed
           }
 
-          // 7. Write the visible handoff pointer into the OLD OpenChamber chat (`resume: false`
-          //    so the old chat stays idle). Isolated so it can never fail a completed rotation.
+          // 6b. Make the rotation visible IMMEDIATELY in the sidebar/header while the old chat is
+          //     idle (`session.update` is synchronous-visible; the queued synthetic notice below is
+          //     only seen on the next wake). Isolated so it can never fail a completed rotation.
+          await updateSessionTitleBestEffort(
+            ctx,
+            state.sessionID,
+            `[Rotated -> ${newSessionID}]`,
+            chain.goal,
+          );
+
+          // 7. Queue the visible handoff pointer into the OLD OpenChamber chat (`resume: false` so
+          //    the old chat stays idle). The title update above is immediate; this queued notice
+          //    ensures any future wake in the old chat immediately informs the model/user.
           try {
             if (typeof ctx?.session?.synthetic === 'function') {
               await ctx.session.synthetic({
@@ -1123,6 +1166,14 @@ export function createReactiveGuard(options = {}) {
           if (typeof ctx?.session?.interrupt === 'function') {
             await ctx.session.interrupt({ sessionID: state.sessionID, resume: false });
           }
+          // Immediate sidebar/header visibility while idle; the queued `resume: false` synthetic
+          // notice below informs the model/user on any future wake in this chat.
+          await updateSessionTitleBestEffort(
+            ctx,
+            state.sessionID,
+            `[HARD STOP: ${tripwire.kind}]`,
+            chain.goal,
+          );
           if (typeof ctx?.session?.synthetic === 'function') {
             await ctx.session.synthetic({
               sessionID: state.sessionID,

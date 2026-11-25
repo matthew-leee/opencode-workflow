@@ -136,6 +136,9 @@ function createGroup(groupKey) {
   /** @type {Map<string, object>} */
   const instances = new Map();
   let nextInstanceSeq = 1;
+  /** @type {Map<number, (event: string, data?: object) => boolean | undefined>} */
+  const recorders = new Map();
+  let nextRecorderSeq = 1;
 
   /** Active event stream owner state. */
   let activeOwnerId = null;
@@ -221,6 +224,37 @@ function createGroup(groupKey) {
   }
 
   const sharedSlots = new Map();
+
+  /**
+   * Register a live audit recorder for this group. The newest live recorder is tried first, so
+   * a hot-reloaded plugin instance automatically takes over from a closed predecessor.
+   * Returns an idempotent release function used by plugin teardown.
+   */
+  function addRecorder(fn) {
+    if (typeof fn !== 'function') return () => {};
+    const id = nextRecorderSeq++;
+    recorders.set(id, fn);
+    return () => {
+      recorders.delete(id);
+    };
+  }
+
+  /**
+   * Write one record through the newest live recorder that succeeds. A recorder returning
+   * `false` (or throwing) is skipped, falling over to the next live plugin instance instead of
+   * silently dropping the record because one instance was reloaded/closed.
+   */
+  function record(event, data = {}) {
+    for (const fn of Array.from(recorders.values()).reverse()) {
+      try {
+        const ok = fn(event, data);
+        if (ok !== false) return true;
+      } catch {
+        // Try the next live recorder.
+      }
+    }
+    return false;
+  }
 
   function getSharedSlot(name, factory) {
     if (!sharedSlots.has(name)) {
@@ -451,6 +485,8 @@ function createGroup(groupKey) {
   return {
     key: groupKey,
     registerInstance,
+    addRecorder,
+    record,
     getSharedSlot,
     updateSessionMeta,
     linkChildSession,
