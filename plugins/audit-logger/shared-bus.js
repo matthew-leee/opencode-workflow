@@ -220,6 +220,26 @@ function createGroup(groupKey) {
     return sessionMeta.get(sessionID) ?? null;
   }
 
+  const sharedSlots = new Map();
+
+  function getSharedSlot(name, factory) {
+    if (!sharedSlots.has(name)) {
+      sharedSlots.set(name, factory());
+    }
+    return sharedSlots.get(name);
+  }
+
+  function findInstanceForSession(sessionID, fallbackOwner) {
+    const meta = typeof sessionID === 'string' ? sessionMeta.get(sessionID) : null;
+    if (meta?.directory) {
+      for (const inst of instances.values()) {
+        if (inst.directory === meta.directory) return inst;
+      }
+    }
+    if (fallbackOwner && instances.has(fallbackOwner.id)) return fallbackOwner;
+    return instances.values().next().value ?? null;
+  }
+
   function dispatchEvent(event, owner) {
     let eventID = null;
     try {
@@ -243,15 +263,21 @@ function createGroup(groupKey) {
       }
     }
 
-    // Notify any registered per-event observers (e.g., Blackboard / Wave 2 Reactive Guard)
-    // once per unique event.
-    for (const inst of instances.values()) {
-      if (typeof inst.onBusEvent === 'function') {
-        try {
-          inst.onBusEvent(event);
-        } catch (error) {
-          inst.onError?.('event.observer', error);
-        }
+    // Deliver the unique event ONCE to the owning session's location instance (for stateful
+    // in-process monitors like the Wave 2 Reactive Guard so multi-location daemons never
+    // double-process one event).
+    let sessionID = null;
+    try {
+      sessionID = event?.data?.sessionID ?? null;
+    } catch {
+      sessionID = null;
+    }
+    const target = findInstanceForSession(sessionID, owner);
+    if (target && typeof target.onBusEvent === 'function') {
+      try {
+        target.onBusEvent(event);
+      } catch (error) {
+        target.onError?.('event.observer', error);
       }
     }
     return true;
@@ -425,6 +451,7 @@ function createGroup(groupKey) {
   return {
     key: groupKey,
     registerInstance,
+    getSharedSlot,
     updateSessionMeta,
     linkChildSession,
     resolveRootSessionID,

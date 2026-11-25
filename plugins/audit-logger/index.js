@@ -41,11 +41,31 @@ import {
   validateSubagentOutput,
 } from './blackboard.js';
 import {
+  DEFAULT_MEMORY_REFRESH_CONFIG,
+  createMemoryRefresher,
+  isEligibleMemoryWorkspace,
+} from './memory-refresh.js';
+import {
   classifyEnvReference,
   evaluatePermissionInput,
   evaluateShellCommand,
   parseShellSegments,
 } from './permission-guard.js';
+import {
+  DEFAULT_GUARD_CONFIG,
+  GUARD_ACTIONS,
+  assertNotTerra,
+  buildRotationHandoffPrompt,
+  createReactiveGuard,
+  detectOscillatingEdits,
+  deterministicFallbackDecision,
+  isBannedModel,
+  isReviewerRejectionText,
+  judgeTripwire,
+  normalizeErrorSignature,
+  normalizeGuardDecision,
+  resolveGuardConfig,
+} from './reactive-guard.js';
 import { REDACTED, redact, redactString } from './redact.js';
 import {
   BoundedMetaMap,
@@ -61,23 +81,39 @@ export {
   BLACKBOARD_MARKER,
   BoundedMetaMap,
   BoundedSeenSet,
+  DEFAULT_GUARD_CONFIG,
+  DEFAULT_MEMORY_REFRESH_CONFIG,
+  GUARD_ACTIONS,
   MAX_SEEN_EVENT_IDS,
   REDACTED,
+  assertNotTerra,
+  buildRotationHandoffPrompt,
   classifyEnvReference,
   collectWorkspaceFallbackState,
   createBlackboardManager,
+  createMemoryRefresher,
+  createReactiveGuard,
+  detectOscillatingEdits,
+  deterministicFallbackDecision,
   evaluatePermissionInput,
   evaluateShellCommand,
   extractBackgroundSubagentResults,
   extractSubagentResultInfo,
   formatModelRef,
   getSharedBus,
+  isBannedModel,
+  isEligibleMemoryWorkspace,
+  isReviewerRejectionText,
   isSensitiveAttachmentName,
+  judgeTripwire,
+  normalizeErrorSignature,
+  normalizeGuardDecision,
   parseShellSegments,
   redact,
   redactString,
   resetSharedBusForTests,
   resolveBlackboardRoot,
+  resolveGuardConfig,
   validateSubagentOutput,
 };
 
@@ -680,6 +716,53 @@ export default Plugin.define({
       }
     };
 
+    const guardOptions = safeRead(ctx?.options, 'guard');
+    const onSessionRotated = ({ newSessionID, rootSessionID, directory, agent, model }) => {
+      bus.updateSessionMeta(newSessionID, { rootSessionID, directory, agent, model });
+    };
+
+    let guard;
+    try {
+      guard = guardOptions && typeof guardOptions === 'object'
+        ? createReactiveGuard({
+            config: guardOptions.config ?? guardOptions,
+            judge: guardOptions.judge,
+            fetchImpl: guardOptions.fetchImpl,
+            clock: guardOptions.clock,
+            blackboard,
+            record,
+            onSessionRotated,
+          })
+        : bus.getSharedSlot('reactiveGuard', () =>
+            createReactiveGuard({
+              blackboard,
+              record,
+              onSessionRotated,
+            }),
+          );
+    } catch (error) {
+      // A banned model in config/env (or any other construction failure) must never take the
+      // whole plugin — audit logger and Wave 1 permission guard included — down with it.
+      record('plugin.error', { where: 'guard.init', message: describeError(error) });
+      guard = createReactiveGuard({ config: { enabled: false }, env: {}, blackboard, record });
+    }
+
+    const memoryOptions = safeRead(ctx?.options, 'memoryRefresh');
+    let memoryRefresher;
+    try {
+      memoryRefresher = createMemoryRefresher({
+        config: memoryOptions && typeof memoryOptions === 'object' ? (memoryOptions.config ?? memoryOptions) : undefined,
+        llm: memoryOptions?.llm,
+        clock: memoryOptions?.clock,
+        dbPath: memoryOptions?.dbPath !== undefined ? memoryOptions.dbPath : false,
+        auditDir: log.directory !== 'unavailable' ? log.directory : null,
+        record,
+      });
+    } catch (error) {
+      record('plugin.error', { where: 'memoryRefresh.init', message: describeError(error) });
+      memoryRefresher = createMemoryRefresher({ config: { enabled: false }, env: {}, record });
+    }
+
     function resolveLocationForSession(sessionID, explicitLocation = null) {
       if (explicitLocation && typeof explicitLocation === 'object' && safeRead(explicitLocation, 'directory')) {
         return optionalRedact(explicitLocation);
@@ -785,6 +868,20 @@ export default Plugin.define({
         const skills = safeRead(prompt, 'skills');
 
         touchSession(sessionID);
+        if (typeof sessionID === 'string' && sessionID.length > 0) {
+          const meta = bus.getSessionMeta(sessionID);
+          try {
+            guard.onPrompt({
+              sessionID,
+              text: typeof text === 'string' ? text : '',
+              directory: locationDir,
+              parentSessionID: meta?.parentSessionID ?? null,
+              rootSessionID: meta?.rootSessionID ?? sessionID,
+            });
+          } catch (error) {
+            record('plugin.error', { where: 'guard.onPrompt', message: describeError(error) });
+          }
+        }
 
         let materialized = [];
         if (typeof sessionID === 'string' && Array.isArray(files) && files.length > 0) {
@@ -861,6 +958,19 @@ export default Plugin.define({
         const meta = bus.getSessionMeta(sessionID);
         const isChildSession = Boolean(meta?.parentSessionID && meta.parentSessionID !== sessionID);
 
+        try {
+          guard.onSessionContext({
+            sessionID,
+            agent: typeof agent === 'string' ? agent : null,
+            model: formatModelRef(model),
+            directory: locationDir,
+            parentSessionID: meta?.parentSessionID ?? null,
+            rootSessionID,
+          });
+        } catch (error) {
+          record('plugin.error', { where: 'guard.onSessionContext', message: describeError(error) });
+        }
+
         // Refresh Blackboard pointer in child system prompt so resumed/long-running children
         // see newly materialized attachments and sibling reports.
         if (isChildSession && blackboard.exists(rootSessionID)) {
@@ -908,6 +1018,20 @@ export default Plugin.define({
                       ].filter(Boolean).join('\n'),
                     };
                   })();
+              if (isFirstSight) {
+                try {
+                  await guard.onReviewerOutput({
+                    rootSessionID,
+                    parentSessionID: sessionID,
+                    childSessionID: bg.sessionID,
+                    agent: childMeta?.agent || bg.agent || 'subagent',
+                    text: bg.body,
+                    ctx,
+                  });
+                } catch (error) {
+                  record('plugin.error', { where: 'guard.onReviewerOutput', message: describeError(error) });
+                }
+              }
               if (recorded && !recorded.validation.valid && recorded.fallbackNotice) {
                 const system = safeRead(input, 'system');
                 if (Array.isArray(system)) {
@@ -930,37 +1054,67 @@ export default Plugin.define({
       }
     });
 
-    // (c) session.experimental.idle — capture completed child subagent output into Blackboard.
+    // (c) session.experimental.idle — capture completed child subagent output into Blackboard,
+    //     and trigger Layer 2 automatic bounded `MEMORY.md` refresh on root sessions.
     await addHook('session', 'experimental.idle', async (input) => {
       try {
         const sessionID = safeRead(input, 'sessionID');
         const background = safeRead(input, 'background');
+        const hasPendingBackground = Array.isArray(background) && background.length > 0;
         if (typeof sessionID !== 'string' || sessionID.length === 0) return;
-        if (Array.isArray(background) && background.length > 0) return;
 
         const rootSessionID = (await resolveRootFor(sessionID)) ?? sessionID;
         const meta = bus.getSessionMeta(sessionID);
         const isChildSession = Boolean(meta?.parentSessionID && meta.parentSessionID !== sessionID);
-        if (!isChildSession || !blackboard.exists(rootSessionID)) return;
 
-        if (typeof ctx?.session?.context === 'function') {
-          try {
-            const messages = await ctx.session.context({ sessionID });
-            const latest = inspectLatestAssistantMessage(messages);
-            // Skip tool-call-only turns (not a genuinely empty final response).
-            if (!latest.found || (latest.hasToolCalls && latest.text.trim().length === 0)) return;
-            blackboard.recordSubagentReport({
-              rootSessionID,
-              sessionID,
-              agent: meta?.agent || 'subagent',
-              description: blackboard.readManifest(rootSessionID)?.sessions?.[sessionID]?.description || '',
-              text: latest.text,
-              status: 'completed',
-              directory: meta?.directory || locationDir,
-            });
-          } catch (error) {
-            record('plugin.error', { where: 'blackboard.child_idle', message: describeError(error) });
+        if (isChildSession) {
+          if (!blackboard.exists(rootSessionID)) return;
+          if (typeof ctx?.session?.context === 'function') {
+            try {
+              const messages = await ctx.session.context({ sessionID });
+              const latest = inspectLatestAssistantMessage(messages);
+              // Skip tool-call-only turns (not a genuinely empty final response).
+              if (!latest.found || (latest.hasToolCalls && latest.text.trim().length === 0)) return;
+              blackboard.recordSubagentReport({
+                rootSessionID,
+                sessionID,
+                agent: meta?.agent || 'subagent',
+                description: blackboard.readManifest(rootSessionID)?.sessions?.[sessionID]?.description || '',
+                text: latest.text,
+                status: 'completed',
+                directory: meta?.directory || locationDir,
+              });
+              await guard.onReviewerOutput({
+                rootSessionID,
+                parentSessionID: meta?.parentSessionID ?? rootSessionID,
+                childSessionID: sessionID,
+                agent: meta?.agent || 'subagent',
+                text: latest.text,
+                ctx,
+              });
+            } catch (error) {
+              record('plugin.error', { where: 'blackboard.child_idle', message: describeError(error) });
+            }
           }
+          return;
+        }
+
+        // Layer 2: Root session went idle with no pending background work -> refresh bounded MEMORY.md
+        if (hasPendingBackground) return;
+        const gState = guard.getSessionState(sessionID);
+        const runRefresh = () =>
+          memoryRefresher.maybeRefreshOnIdle({
+            sessionID,
+            isChild: false,
+            directory: meta?.directory || locationDir,
+            toolCalls: gState?.steps ?? 0,
+            fileMutations: gState?.fileMutations ?? 0,
+            ctx,
+          });
+        if (safeRead(ctx?.options, 'syncMemoryRefresh') === true) {
+          await runRefresh();
+        } else {
+          void Promise.resolve().then(runRefresh).catch(() => {});
         }
       } catch (error) {
         record('plugin.error', { where: 'session.experimental.idle', message: describeError(error) });
@@ -1059,6 +1213,12 @@ export default Plugin.define({
                     workspaceID: locationWorkspaceID,
                     agent: childAgent,
                   });
+                  guard.onSubagentSpawn({
+                    parentSessionID: sessionID,
+                    childSessionID: info.childSessionID,
+                    agent: childAgent,
+                    directory: locationDir,
+                  });
                   blackboard.recordSubagentSpawn({
                     rootSessionID,
                     childSessionID: info.childSessionID,
@@ -1077,6 +1237,18 @@ export default Plugin.define({
                     status: info.status || String(status || 'completed'),
                     directory: locationDir,
                   });
+                  try {
+                    await guard.onReviewerOutput({
+                      rootSessionID,
+                      parentSessionID: sessionID,
+                      childSessionID: info.childSessionID || String(callId || 'subagent'),
+                      agent: childAgent,
+                      text: info.text,
+                      ctx,
+                    });
+                  } catch (error) {
+                    record('plugin.error', { where: 'guard.onReviewerOutput', message: describeError(error) });
+                  }
                   if (recorded && !recorded.validation.valid && recorded.fallbackNotice) {
                     appendFallbackToToolResult(resultObj, recorded.fallbackNotice);
                     record('blackboard.subagent_invalid', {
@@ -1142,6 +1314,27 @@ export default Plugin.define({
           data.result = summarizeToolResult(safeRead(input, 'result'));
         }
         record('tool.after', data);
+
+        // Wave 2 Layer 0/1: feed tool completion into the Always-On Reactive Security Guard.
+        if (typeof sessionID === 'string' && sessionID.length > 0) {
+          const meta = bus.getSessionMeta(sessionID);
+          try {
+            await guard.onToolAfter({
+              sessionID,
+              tool: toolName,
+              status,
+              input: safeRead(input, 'input'),
+              error: status === 'error' ? describeError(safeRead(input, 'error')) : null,
+              agent: agent || meta?.agent || null,
+              directory: meta?.directory || locationDir,
+              parentSessionID: meta?.parentSessionID ?? null,
+              rootSessionID: bus.resolveRootSessionID(sessionID) ?? sessionID,
+              ctx,
+            });
+          } catch (error) {
+            record('plugin.error', { where: 'guard.onToolAfter', message: describeError(error) });
+          }
+        }
       } catch (error) {
         record('plugin.error', { where: 'tool.execute.after', message: describeError(error) });
       }
@@ -1336,6 +1529,34 @@ export default Plugin.define({
       eventTypes: EVENT_TYPES,
       directory: locationDir,
       onAuditEvent: logEvent,
+      onBusEvent: (event) => {
+        const type = safeRead(event, 'type');
+        const data = safeRead(event, 'data') ?? {};
+        const sessionID = safeRead(data, 'sessionID');
+        if (typeof sessionID !== 'string' || sessionID.length === 0) return;
+        const meta = bus.getSessionMeta(sessionID);
+        if (type === 'session.usage.updated') {
+          void Promise.resolve()
+            .then(() =>
+              guard.onUsageUpdated({
+                sessionID,
+                cost: safeRead(data, 'cost'),
+                tokens: safeRead(data, 'tokens'),
+                directory: meta?.directory || safeRead(safeRead(event, 'location'), 'directory') || locationDir,
+                parentSessionID: meta?.parentSessionID ?? null,
+                rootSessionID: bus.resolveRootSessionID(sessionID) ?? sessionID,
+                ctx,
+              }),
+            )
+            .catch((error) => record('plugin.error', { where: 'guard.onUsageUpdated', message: describeError(error) }));
+        } else if (type === 'session.compaction.ended') {
+          try {
+            guard.onCompactionEnded({ sessionID });
+          } catch (error) {
+            record('plugin.error', { where: 'guard.onCompactionEnded', message: describeError(error) });
+          }
+        }
+      },
       onError: (where, error) => record('plugin.error', { where, message: describeError(error) }),
     });
 

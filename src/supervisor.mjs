@@ -823,7 +823,7 @@ export async function spawnManagedServer({
       if (listening) baseUrl = listening[1].replace(/\/$/, "");
       const lines = text.split(/\r?\n/);
       for (const line of lines) {
-        const match = line.match(/^\s*server\s+(\S+)\s*$/i);
+        const match = line.match(/^\s*server(?:\s+password)?\s+(\S+)\s*$/i);
         if (match) password = match[1];
       }
       succeed();
